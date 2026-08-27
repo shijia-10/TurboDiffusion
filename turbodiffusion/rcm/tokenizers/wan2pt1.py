@@ -599,7 +599,7 @@ def _video_vae(pretrained_path=None, z_dim=None, device="cpu", **kwargs):
 
 
 class WanVAE:
-    def __init__(self, z_dim=16, vae_pth="", dtype=torch.float, device="cuda", is_amp=True, temporal_window: int = 4):
+    def __init__(self, z_dim=16, vae_pth="", dtype=torch.float, device="npu", is_amp=True, temporal_window: int = 4):
         self.dtype = dtype
         self.device = device
         self.temporal_window = temporal_window
@@ -652,7 +652,7 @@ class WanVAE:
             self.model = self.model.to(dtype=dtype)
             self.context = nullcontext()
         else:
-            self.context = torch.amp.autocast("cuda", dtype=dtype)
+            self.context = torch.amp.autocast("npu", dtype=dtype)
 
     def count_param(self):
         return sum(p.numel() for p in self.model.parameters())

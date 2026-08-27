@@ -23,12 +23,6 @@ import torch.amp as amp
 import torch.nn as nn
 from einops import rearrange, repeat
 
-try:
-    from flash_attn.layers.rotary import apply_rotary_emb as flash_apply_rotary_emb
-except ImportError:
-    flash_apply_rotary_emb = None
-    print("flash_attn is not installed.")
-
 from torch.distributed import ProcessGroup, get_process_group_ranks
 from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper as ptd_checkpoint_wrapper
@@ -40,6 +34,17 @@ from rcm.utils.context_parallel import split_inputs_cp, cat_outputs_cp, cat_outp
 
 T5_CONTEXT_TOKEN_NUMBER = 512
 FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER = 257 * 2
+
+
+def mindie_dense_attention(q, k, v):
+    """Run MindIE dense attention with native BNSD tensors."""
+    try:
+        from mindiesd import attention_forward
+    except ImportError as exc:
+        raise RuntimeError(
+            "MindIE-SD is required for Wan2.2 dense attention on NPU"
+        ) from exc
+    return attention_forward(q, k, v, head_first=True)
 
 
 class VideoRopePosition3DEmb(nn.Module):
@@ -78,9 +83,9 @@ class VideoRopePosition3DEmb(nn.Module):
         dim_h = self._dim_h
         dim_t = self._dim_t
 
-        self.seq = torch.arange(max(self.max_h, self.max_w, self.max_t)).float().cuda()
-        self.dim_spatial_range = torch.arange(0, dim_h, 2)[: (dim_h // 2)].float().cuda() / dim_h
-        self.dim_temporal_range = torch.arange(0, dim_t, 2)[: (dim_t // 2)].float().cuda() / dim_t
+        self.seq = torch.arange(max(self.max_h, self.max_w, self.max_t)).float().npu()
+        self.dim_spatial_range = torch.arange(0, dim_h, 2)[: (dim_h // 2)].float().npu() / dim_h
+        self.dim_temporal_range = torch.arange(0, dim_t, 2)[: (dim_t // 2)].float().npu() / dim_t
         self._is_initialized = True
 
     def generate_embeddings(
@@ -155,25 +160,32 @@ def sinusoidal_embedding_1d(dim, position):
 
 def rope_apply(x, freqs):
     """
-    Optimized version of rope_apply using flash_attention's rotary embedding implementation.
-    This version processes the entire batch at once for efficiency.
+    Apply interleaved rotary embeddings to BNSD query/key tensors.
 
     Args:
-        x (Tensor): Input tensor with shape [batch_size, seq_len, n_heads, head_dim]
+        x (Tensor): Input tensor with shape [batch_size, n_heads, seq_len, head_dim]
         freqs (Tensor): Complex frequencies with shape [max_seq_len, head_dim // 2]
 
     Returns:
         Tensor: Rotary-embedded tensor with same shape as input
     """
-    batch_size, seq_len, n_heads, head_dim = x.shape
+    batch_size, n_heads, seq_len, head_dim = x.shape
 
     # freqs is already sharded to local seq_len under flattened CP
     freqs = freqs.view(seq_len, head_dim // 2)
     cos = torch.cos(freqs).to(torch.float32)
     sin = torch.sin(freqs).to(torch.float32)
 
-    # Apply the rotation
-    rotated = flash_apply_rotary_emb(x.to(torch.float32), cos, sin, interleaved=True, inplace=False)
+    x_float = x.float()
+    cos = cos.unsqueeze(0).unsqueeze(1)
+    sin = sin.unsqueeze(0).unsqueeze(1)
+    rotated = torch.stack(
+        (
+            x_float[..., 0::2] * cos - x_float[..., 1::2] * sin,
+            x_float[..., 0::2] * sin + x_float[..., 1::2] * cos,
+        ),
+        dim=-1,
+    ).flatten(-2)
 
     return rotated.to(x.dtype)
 
@@ -208,7 +220,7 @@ class WanLayerNorm(nn.LayerNorm):
         Args:
             x(Tensor): Shape [B, L, C]
         """
-        with amp.autocast("cuda", dtype=torch.float32):
+        with amp.autocast("npu", dtype=torch.float32):
             return super().forward(x.float()).type_as(x)
 
 
@@ -230,7 +242,7 @@ class WanSelfAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.attn_op = MinimalA2AAttnOp()
+        self.attn_op = MinimalA2AAttnOp(local_attn=mindie_dense_attention)
 
     def init_weights(self):
         std = 1.0 / math.sqrt(self.dim)
@@ -259,16 +271,16 @@ class WanSelfAttention(nn.Module):
 
         # query, key, value function
         def qkv_fn(x):
-            q = self.norm_q(self.q(x)).view(b, s, n, d)
-            k = self.norm_k(self.k(x)).view(b, s, n, d)
-            v = self.v(x).view(b, s, n, d)
+            q = self.norm_q(self.q(x)).view(b, s, n, d).transpose(1, 2)
+            k = self.norm_k(self.k(x)).view(b, s, n, d).transpose(1, 2)
+            v = self.v(x).view(b, s, n, d).transpose(1, 2)
             return q, k, v
 
         q, k, v = qkv_fn(x)
         q = rope_apply(q, freqs)
         k = rope_apply(k, freqs)
 
-        x = self.attn_op(q, k, v)
+        x = self._apply_attention(q, k, v)
 
         # output
         x = x.flatten(2)
@@ -277,6 +289,12 @@ class WanSelfAttention(nn.Module):
 
     def set_context_parallel_group(self, process_group, ranks, stream):
         self.attn_op.set_context_parallel_group(process_group, ranks, stream)
+
+    def _apply_attention(self, q, k, v):
+        if self.attn_op.pg is not None:
+            raise RuntimeError("BNSD Wan attention does not support context parallel in phase 1")
+        output = self.attn_op.local_attn(q, k, v)
+        return output.transpose(1, 2).contiguous()
 
 
 class WanCrossAttention(WanSelfAttention):
@@ -290,12 +308,12 @@ class WanCrossAttention(WanSelfAttention):
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
         # compute query, key, value
-        q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context)).view(b, -1, n, d)
-        v = self.v(context).view(b, -1, n, d)
+        q = self.norm_q(self.q(x)).view(b, -1, n, d).transpose(1, 2)
+        k = self.norm_k(self.k(context)).view(b, -1, n, d).transpose(1, 2)
+        v = self.v(context).view(b, -1, n, d).transpose(1, 2)
 
         # compute attention
-        x = self.attn_op(q, k, v)
+        x = self._apply_attention(q, k, v)
         # output
         x = x.flatten(2)
         x = self.o(x)
@@ -346,20 +364,20 @@ class WanAttentionBlock(nn.Module):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         assert e.dtype == torch.float32
-        with amp.autocast("cuda", dtype=torch.float32):
+        with amp.autocast("npu", dtype=torch.float32):
             e = (self.modulation + e).chunk(6, dim=1)
         assert e[0].dtype == torch.float32
 
         # self-attention
         y = self.self_attn((self.norm1(x).float() * (1 + e[1]) + e[0]).type_as(x), seq_lens, freqs)
-        with amp.autocast("cuda", dtype=torch.float32):
+        with amp.autocast("npu", dtype=torch.float32):
             x = x + y * e[2].type_as(x)
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
             y = self.ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).type_as(x))
-            with amp.autocast("cuda", dtype=torch.float32):
+            with amp.autocast("npu", dtype=torch.float32):
                 x = x + y * e[5].type_as(x)
             return x
 
@@ -398,7 +416,7 @@ class Head(nn.Module):
             e(Tensor): Shape [B, C]
         """
         assert e.dtype == torch.float32
-        with amp.autocast("cuda", dtype=torch.float32):
+        with amp.autocast("npu", dtype=torch.float32):
             e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
             x = self.head(self.norm(x) * (1 + e[1]) + e[0])
         return x
@@ -608,7 +626,7 @@ class WanModel(nn.Module):
         seq_lens = torch.tensor([u.size(0) for u in x_B_L_D], dtype=torch.long)
 
         # time embeddings
-        with amp.autocast("cuda", dtype=torch.float32):
+        with amp.autocast("npu", dtype=torch.float32):
             e_B_D = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t_B).float())
             e0_B_6_D = self.time_projection(e_B_D).unflatten(1, (6, self.dim))
             assert e_B_D.dtype == torch.float32 and e0_B_6_D.dtype == torch.float32

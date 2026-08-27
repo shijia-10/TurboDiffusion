@@ -469,7 +469,7 @@ def load_model_torch(model, ckpt_path):
     if distributed.is_rank0():
         ckpt = easy_io.load(
             ckpt_path,
-            map_location="cuda",
+            map_location="npu",
         )
         model.load_state_dict(ckpt, assign=True)
 
@@ -482,7 +482,7 @@ class UMT5EncoderModel:
         self,
         text_len=512,
         dtype=torch.bfloat16,
-        device=torch.cuda.current_device(),
+        device="npu",
         checkpoint_path="models_t5_umt5-xxl-enc-bf16.pth",
         tokenizer_path="google/umt5-xxl",
     ):
@@ -524,7 +524,7 @@ t5_encoder: Optional[UMT5EncoderModel] = None
 def get_umt5_embedding(
     checkpoint_path: str,
     prompts: Union[str, List[str]],
-    device: str = "cuda",
+    device: str = "npu",
     max_length: int = 512,
 ) -> torch.Tensor:
     global t5_encoder
@@ -535,11 +535,11 @@ def get_umt5_embedding(
 
 def clear_umt5_memory():
     """
-    Clears the GPU memory by deleting the global t5_encoder model and emptying the CUDA cache.
+    Delete the global text encoder and empty the selected accelerator cache.
     """
     global t5_encoder
     if t5_encoder is not None:
         del t5_encoder
         t5_encoder = None
     gc.collect()
-    torch.cuda.empty_cache()
+    torch.npu.empty_cache()

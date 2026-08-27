@@ -35,6 +35,21 @@ from modify_model import tensor_kwargs, create_model
 torch._dynamo.config.suppress_errors = True
 
 
+def initialize_npu(device_id: int) -> dict:
+    """Bind one Ascend NPU and return the tensor placement contract."""
+    try:
+        import torch_npu
+    except ImportError as exc:
+        raise RuntimeError("torch_npu is required for Wan2.2 I2V inference") from exc
+
+    if not torch.npu.is_available():
+        raise RuntimeError("No available Ascend NPU was detected")
+
+    torch.npu.set_device(device_id)
+
+    return {"device": f"npu:{device_id}", "dtype": torch.bfloat16}
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="TurboDiffusion inference script for Wan2.2 I2V with High/Low Noise models")
     parser.add_argument("--image_path", type=str, default=None, help="Path to the input image (required unless --serve)")
@@ -55,16 +70,18 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--ode", action="store_true", help="Use ODE for sampling (sharper but less robust than SDE)")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility")
     parser.add_argument("--save_path", type=str, default="output/generated_video.mp4", help="Path to save the generated video (include file extension)")
-    parser.add_argument("--attention_type", choices=["sla", "sagesla", "original"], default="sagesla", help="Type of attention mechanism to use")
+    parser.add_argument("--attention_type", choices=["sla", "original"], default="sla", help="Type of attention mechanism to use")
     parser.add_argument("--sla_topk", type=float, default=0.1, help="Top-k ratio for SLA/SageSLA attention")
     parser.add_argument("--quant_linear", action="store_true", help="Whether to replace Linear layers with quantized versions")
     parser.add_argument("--default_norm", action="store_true", help="Whether to replace LayerNorm/RMSNorm layers with faster versions")
     parser.add_argument("--serve", action="store_true", help="Launch interactive TUI server mode (keeps model loaded)")
+    parser.add_argument("--device_id", type=int, default=0, help="Ascend NPU device ID")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_arguments()
+    tensor_kwargs.update(initialize_npu(args.device_id))
 
     # Handle serve mode
     if args.serve:
@@ -89,9 +106,9 @@ if __name__ == "__main__":
 
     log.info(f"Loading DiT models.")
     high_noise_model = create_model(dit_path=args.high_noise_model_path, args=args).cpu()
-    torch.cuda.empty_cache()
+    torch.npu.empty_cache()
     low_noise_model = create_model(dit_path=args.low_noise_model_path, args=args).cpu()
-    torch.cuda.empty_cache()
+    torch.npu.empty_cache()
     log.success(f"Successfully loaded DiT model.")
 
     tokenizer = Wan2pt1VAEInterface(vae_pth=args.vae_path)
@@ -144,7 +161,7 @@ if __name__ == "__main__":
         encoded_latents = tokenizer.encode(frames_to_encode)  # -> B, C_lat, T_lat, H_lat, W_lat
         
         del frames_to_encode
-        torch.cuda.empty_cache()
+        torch.npu.empty_cache()
 
     msk = torch.zeros(1, 4, lat_t, lat_h, lat_w, device=tensor_kwargs["device"], dtype=tensor_kwargs["dtype"])
     msk[:, :, 0, :, :] = 1.0
@@ -184,14 +201,14 @@ if __name__ == "__main__":
     x = init_noise.to(torch.float64) * t_steps[0]
     ones = torch.ones(x.size(0), 1, device=x.device, dtype=x.dtype)
     total_steps = t_steps.shape[0] - 1
-    high_noise_model.cuda()
+    high_noise_model.to(tensor_kwargs["device"])
     net = high_noise_model
     switched = False
     for i, (t_cur, t_next) in enumerate(tqdm(list(zip(t_steps[:-1], t_steps[1:])), desc="Sampling", total=total_steps)):
         if t_cur.item() < args.boundary and not switched:
             high_noise_model.cpu()
-            torch.cuda.empty_cache()
-            low_noise_model.cuda()
+            torch.npu.empty_cache()
+            low_noise_model.to(tensor_kwargs["device"])
             net = low_noise_model
             switched = True
             log.info("Switched to low noise model.")
@@ -210,7 +227,7 @@ if __name__ == "__main__":
                 )
     samples = x.float()
     low_noise_model.cpu()
-    torch.cuda.empty_cache()
+    torch.npu.empty_cache()
 
     with torch.no_grad():
         video = tokenizer.decode(samples)
