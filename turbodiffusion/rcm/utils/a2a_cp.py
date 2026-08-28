@@ -63,6 +63,61 @@ def single_all_to_all(input, local_seq_2_local_head, group, async_op=False):
     return res
 
 
+def single_all_to_all_bnsd(input: Tensor, scatter_heads: bool, group) -> Tensor:
+    """Exchange BNSD sequence shards and attention-head shards synchronously."""
+    world_size = dist.get_world_size(group)
+    if scatter_heads:
+        batch, total_heads, local_sequence, head_dim = input.shape
+        if total_heads % world_size:
+            raise ValueError(
+                f"Number of heads ({total_heads}) must be divisible by "
+                f"Ulysses size ({world_size})"
+            )
+        communication_input = rearrange(
+            input,
+            "b (w h) s d -> w b h s d",
+            w=world_size,
+        ).contiguous()
+    else:
+        batch, local_heads, global_sequence, head_dim = input.shape
+        if global_sequence % world_size:
+            raise ValueError(
+                f"Sequence length ({global_sequence}) must be divisible by "
+                f"Ulysses size ({world_size})"
+            )
+        communication_input = rearrange(
+            input,
+            "b h (w s) d -> w b h s d",
+            w=world_size,
+        ).contiguous()
+
+    communication_output = torch.empty_like(communication_input)
+    dist.all_to_all_single(
+        communication_output,
+        communication_input,
+        group=group,
+        async_op=False,
+    )
+    if scatter_heads:
+        return rearrange(
+            communication_output,
+            "w b h s d -> b h (w s) d",
+        ).contiguous()
+    return rearrange(
+        communication_output,
+        "w b h s d -> b (w h) s d",
+    ).contiguous()
+
+
+def bnsd_ulysses_attention(query, key, value, local_attention, group):
+    """Run local BNSD attention between the two Ulysses All-to-All calls."""
+    query = single_all_to_all_bnsd(query, scatter_heads=True, group=group)
+    key = single_all_to_all_bnsd(key, scatter_heads=True, group=group)
+    value = single_all_to_all_bnsd(value, scatter_heads=True, group=group)
+    output = local_attention(query, key, value)
+    return single_all_to_all_bnsd(output, scatter_heads=False, group=group)
+
+
 def async_a2a_communicate(
     a2a_inputs: Union[torch.Tensor, List[torch.Tensor]],
     cp_size: int,

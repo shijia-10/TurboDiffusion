@@ -15,6 +15,7 @@
 
 import argparse
 import math
+import os
 
 import torch
 from einops import rearrange, repeat
@@ -50,6 +51,161 @@ def initialize_npu(device_id: int) -> dict:
     return {"device": f"npu:{device_id}", "dtype": torch.bfloat16}
 
 
+def initialize_ulysses_npu(ulysses_size: int) -> tuple[dict, int, object]:
+    """Bind the torchrun local NPU and initialize the HCCL Ulysses group."""
+    try:
+        import torch_npu
+    except ImportError as exc:
+        raise RuntimeError("torch_npu is required for Wan2.2 I2V inference") from exc
+
+    values = {}
+    for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE"):
+        try:
+            values[name] = int(os.environ[name])
+        except KeyError as exc:
+            raise ValueError(
+                f"Missing {name}; launch multi-NPU inference with torchrun"
+            ) from exc
+        except ValueError as exc:
+            raise ValueError(f"{name} must be an integer") from exc
+
+    rank = values["RANK"]
+    local_rank = values["LOCAL_RANK"]
+    world_size = values["WORLD_SIZE"]
+    if ulysses_size <= 0:
+        raise ValueError("ulysses_size must be positive")
+    if ulysses_size != world_size:
+        raise ValueError(
+            f"ulysses_size={ulysses_size} must equal WORLD_SIZE={world_size}"
+        )
+    if not 0 <= rank < world_size:
+        raise ValueError(f"RANK={rank} must be in [0, {world_size})")
+    if not 0 <= local_rank < world_size:
+        raise ValueError(
+            f"LOCAL_RANK={local_rank} must be in [0, {world_size})"
+        )
+    if not torch.npu.is_available():
+        raise RuntimeError("No available Ascend NPU was detected")
+
+    torch.npu.set_device(local_rank)
+    torch.distributed.init_process_group(backend="hccl", init_method="env://")
+    return (
+        {"device": f"npu:{local_rank}", "dtype": torch.bfloat16},
+        rank,
+        torch.distributed.group.WORLD,
+    )
+
+
+def initialize_inference_npu(args: argparse.Namespace) -> tuple[int, object | None]:
+    """Select the single-NPU or torchrun Ulysses initialization path."""
+    try:
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    except ValueError as exc:
+        raise ValueError("WORLD_SIZE must be an integer") from exc
+
+    if world_size > 1 or args.ulysses_size > 1:
+        placement, rank, ulysses_group = initialize_ulysses_npu(
+            args.ulysses_size
+        )
+    else:
+        placement = initialize_npu(args.device_id)
+        rank = 0
+        ulysses_group = None
+    tensor_kwargs.update(placement)
+    return rank, ulysses_group
+
+"""Make slight adjustments to H and W so that the final S is evenly divisible by the Ulysses size."""
+def align_resolution_for_ulysses(
+    height: int,
+    width: int,
+    latent_frames: int,
+    spatial_token_stride: int,
+    ulysses_size: int,
+) -> tuple[int, int]:
+    """Minimally enlarge one dimension so video tokens divide by Ulysses."""
+    for name, value in (
+        ("height", height),
+        ("width", width),
+        ("latent_frames", latent_frames),
+        ("spatial_token_stride", spatial_token_stride),
+        ("ulysses_size", ulysses_size),
+    ):
+        if value <= 0:
+            raise ValueError(f"{name} must be positive")
+    if height % spatial_token_stride or width % spatial_token_stride:
+        raise ValueError(
+            "height and width must be divisible by spatial_token_stride"
+        )
+
+    token_height = height // spatial_token_stride
+    token_width = width // spatial_token_stride
+    token_count = latent_frames * token_height * token_width
+    if token_count % ulysses_size == 0:
+        return height, width
+
+    height_multiple = ulysses_size // math.gcd(
+        ulysses_size, latent_frames * token_width
+    )
+    aligned_token_height = (
+        (token_height + height_multiple - 1) // height_multiple
+    ) * height_multiple
+
+    width_multiple = ulysses_size // math.gcd(
+        ulysses_size, latent_frames * token_height
+    )
+    aligned_token_width = (
+        (token_width + width_multiple - 1) // width_multiple
+    ) * width_multiple
+
+    height_candidate = aligned_token_height * spatial_token_stride
+    width_candidate = aligned_token_width * spatial_token_stride
+    if height_candidate * width <= height * width_candidate:
+        return height_candidate, width
+    return height, width_candidate
+
+
+def enable_ulysses(models, ulysses_group) -> None:
+    """Attach the same Ulysses process group to every noise model."""
+    if ulysses_group is None:
+        return
+    for model in models:
+        model.enable_context_parallel(ulysses_group)
+
+
+def sampling_progress(timesteps, rank: int):
+    """Show the sampling progress bar on rank 0 only."""
+    steps = list(zip(timesteps[:-1], timesteps[1:]))
+    return tqdm(
+        steps,
+        desc="Sampling",
+        total=len(steps),
+        disable=rank != 0,
+    )
+
+
+def decode_and_save_rank0(rank, tokenizer, samples, save_path: str) -> bool:
+    """Decode and save the generated video on rank 0 only."""
+    if rank != 0:
+        return False
+    with torch.no_grad():
+        video = tokenizer.decode(samples)
+    videos = (1.0 + video.float().cpu().unsqueeze(0).clamp(-1, 1)) / 2.0
+    save_image_or_video(
+        rearrange(videos, "n b c t h w -> c t (n h) (b w)"),
+        save_path,
+        fps=16,
+    )
+    return True
+
+
+def finalize_ulysses(ulysses_group) -> None:
+    """Synchronize all Ulysses ranks before releasing the HCCL group."""
+    if ulysses_group is None:
+        return
+    torch.distributed.barrier(group=ulysses_group)
+    torch.distributed.destroy_process_group(ulysses_group)
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="TurboDiffusion inference script for Wan2.2 I2V with High/Low Noise models")
     parser.add_argument("--image_path", type=str, default=None, help="Path to the input image (required unless --serve)")
@@ -76,12 +232,18 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--default_norm", action="store_true", help="Whether to replace LayerNorm/RMSNorm layers with faster versions")
     parser.add_argument("--serve", action="store_true", help="Launch interactive TUI server mode (keeps model loaded)")
     parser.add_argument("--device_id", type=int, default=0, help="Ascend NPU device ID")
+    parser.add_argument(
+        "--ulysses-size",
+        type=int,
+        default=1,
+        help="Ulysses sequence-parallel degree; must equal torchrun WORLD_SIZE",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_arguments()
-    tensor_kwargs.update(initialize_npu(args.device_id))
+    rank, ulysses_group = initialize_inference_npu(args)
 
     # Handle serve mode
     if args.serve:
@@ -109,6 +271,10 @@ if __name__ == "__main__":
     torch.npu.empty_cache()
     low_noise_model = create_model(dit_path=args.low_noise_model_path, args=args).cpu()
     torch.npu.empty_cache()
+    enable_ulysses(
+        [high_noise_model, low_noise_model],
+        ulysses_group,
+    )
     log.success(f"Successfully loaded DiT model.")
 
     tokenizer = Wan2pt1VAEInterface(vae_pth=args.vae_path)
@@ -139,9 +305,26 @@ if __name__ == "__main__":
         w, h = VIDEO_RES_SIZE_INFO[args.resolution][args.aspect_ratio]
         log.info(f"Resolution set to: {w}x{h}")
     F = args.num_frames
+    spatial_token_stride = tokenizer.spatial_compression_factor * 2
+    lat_t = tokenizer.get_latent_num_frames(F)
+    if ulysses_group is not None:
+        original_h, original_w = h, w
+        h, w = align_resolution_for_ulysses(
+            height=h,
+            width=w,
+            latent_frames=lat_t,
+            spatial_token_stride=spatial_token_stride,
+            ulysses_size=args.ulysses_size,
+        )
+        if rank == 0 and (h, w) != (original_h, original_w):
+            log.info(
+                f"Adjusted resolution for Ulysses: "
+                f"{original_w}x{original_h} -> {w}x{h}; "
+                f"tokens={lat_t}x{h // spatial_token_stride}x"
+                f"{w // spatial_token_stride}"
+            )
     lat_h = h // tokenizer.spatial_compression_factor
     lat_w = w // tokenizer.spatial_compression_factor
-    lat_t = tokenizer.get_latent_num_frames(F)
 
     log.info(f"Preprocessing image to {w}x{h}...")
     image_transforms = T.Compose(
@@ -172,8 +355,6 @@ if __name__ == "__main__":
     log.info(f"Generating with prompt: {args.prompt}")
     condition = {"crossattn_emb": repeat(text_emb.to(**tensor_kwargs), "b l d -> (k b) l d", k=args.num_samples), "y_B_C_T_H_W": y}
 
-    to_show = []
-
     state_shape = [tokenizer.latent_ch, lat_t, lat_h, lat_w]
 
     generator = torch.Generator(device=tensor_kwargs["device"])
@@ -200,11 +381,10 @@ if __name__ == "__main__":
 
     x = init_noise.to(torch.float64) * t_steps[0]
     ones = torch.ones(x.size(0), 1, device=x.device, dtype=x.dtype)
-    total_steps = t_steps.shape[0] - 1
     high_noise_model.to(tensor_kwargs["device"])
     net = high_noise_model
     switched = False
-    for i, (t_cur, t_next) in enumerate(tqdm(list(zip(t_steps[:-1], t_steps[1:])), desc="Sampling", total=total_steps)):
+    for t_cur, t_next in sampling_progress(t_steps, rank):
         if t_cur.item() < args.boundary and not switched:
             high_noise_model.cpu()
             torch.npu.empty_cache()
@@ -229,11 +409,11 @@ if __name__ == "__main__":
     low_noise_model.cpu()
     torch.npu.empty_cache()
 
-    with torch.no_grad():
-        video = tokenizer.decode(samples)
-
-    to_show.append(video.float().cpu())
-
-    to_show = (1.0 + torch.stack(to_show, dim=0).clamp(-1, 1)) / 2.0
-
-    save_image_or_video(rearrange(to_show, "n b c t h w -> c t (n h) (b w)"), args.save_path, fps=16)
+    if decode_and_save_rank0(
+        rank,
+        tokenizer,
+        samples,
+        args.save_path,
+    ):
+        log.success(f"Saved generated video to: {args.save_path}")
+    finalize_ulysses(ulysses_group)

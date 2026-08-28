@@ -163,6 +163,59 @@ def test_fast_layernorm_switch_controls_attention_block_norms(
         assert calls == [block.norm1, block.norm3, block.norm2]
 
 
+def test_context_parallel_split_preserves_current_tensor_device(monkeypatch):
+    context_parallel = importlib.import_module("rcm.utils.context_parallel")
+
+    class Group:
+        @staticmethod
+        def rank():
+            return 1
+
+    monkeypatch.setattr(
+        context_parallel,
+        "get_process_group_ranks",
+        lambda group: [0, 1],
+    )
+    x = torch.arange(8).view(1, 8, 1)
+
+    output = context_parallel.split_inputs_cp(
+        x,
+        seq_dim=1,
+        cp_group=Group(),
+    )
+
+    assert output.device == x.device
+    torch.testing.assert_close(output.flatten(), torch.tensor([4, 5, 6, 7]))
+
+
+def test_context_parallel_broadcast_preserves_current_tensor_device(
+    monkeypatch,
+):
+    context_parallel = importlib.import_module("rcm.utils.context_parallel")
+    group = object()
+    monkeypatch.setattr(
+        context_parallel,
+        "get_process_group_ranks",
+        lambda process_group: [0, 1],
+    )
+    monkeypatch.setattr(
+        context_parallel.distributed,
+        "get_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        context_parallel.torch.distributed,
+        "broadcast",
+        lambda tensor, src, group: None,
+    )
+    x = torch.arange(4).view(1, 4)
+
+    output = context_parallel.broadcast(x, group)
+
+    assert output.device == x.device
+    torch.testing.assert_close(output, x)
+
+
 @pytest.mark.parametrize("attention_class", ["WanSelfAttention", "WanCrossAttention"])
 def test_wan_attention_bnsd_calls_local_backend_and_restores_bsc(attention_class):
     wan2pt2 = importlib.import_module("rcm.networks.wan2pt2")
@@ -191,23 +244,3 @@ def test_wan_attention_bnsd_calls_local_backend_and_restores_bsc(attention_class
 
     assert backend.seen == expected_shapes
     assert output.shape == (1, 4, 256)
-
-
-def test_bnsd_attention_rejects_context_parallel_before_local_backend():
-    wan2pt2 = importlib.import_module("rcm.networks.wan2pt2")
-    attention = wan2pt2.WanSelfAttention(dim=256, num_heads=2)
-    backend = CaptureLocalAttention()
-    attention.attn_op.local_attn = backend
-    attention.attn_op.pg = object()
-
-    with pytest.raises(
-        RuntimeError,
-        match="BNSD Wan attention does not support context parallel in phase 1",
-    ):
-        attention(
-            torch.randn(1, 4, 256),
-            seq_lens=torch.tensor([4]),
-            freqs=torch.zeros(4, 64),
-        )
-
-    assert backend.seen is None

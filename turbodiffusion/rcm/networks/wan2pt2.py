@@ -29,7 +29,7 @@ from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper as ptd_checkpoint_wrapper
 
 from imaginaire.utils import log
-from rcm.utils.a2a_cp import MinimalA2AAttnOp
+from rcm.utils.a2a_cp import MinimalA2AAttnOp, bnsd_ulysses_attention
 from rcm.utils.selective_activation_checkpoint import CheckpointMode, SACConfig
 from rcm.utils.context_parallel import split_inputs_cp, cat_outputs_cp, cat_outputs_cp_with_grad, broadcast
 
@@ -298,8 +298,15 @@ class WanSelfAttention(nn.Module):
 
     def _apply_attention(self, q, k, v):
         if self.attn_op.pg is not None:
-            raise RuntimeError("BNSD Wan attention does not support context parallel in phase 1")
-        output = self.attn_op.local_attn(q, k, v)
+            output = bnsd_ulysses_attention(
+                q,
+                k,
+                v,
+                self.attn_op.local_attn,
+                self.attn_op.pg,
+            )
+        else:
+            output = self.attn_op.local_attn(q, k, v)
         return output.transpose(1, 2).contiguous()
 
 
@@ -750,7 +757,7 @@ class WanModel(nn.Module):
             block.self_attn.set_context_parallel_group(
                 process_group=None,
                 ranks=None,
-                stream=torch.cuda.Stream(),
+                stream=None,
             )
 
         self._is_context_parallel_enabled = False
@@ -759,7 +766,11 @@ class WanModel(nn.Module):
     def enable_context_parallel(self, process_group: Optional[ProcessGroup] = None):
         cp_ranks = get_process_group_ranks(process_group)
         for block in self.blocks:
-            block.self_attn.set_context_parallel_group(process_group=process_group, ranks=cp_ranks, stream=torch.cuda.Stream())
+            block.self_attn.set_context_parallel_group(
+                process_group=process_group,
+                ranks=cp_ranks,
+                stream=None,
+            )
 
         self._is_context_parallel_enabled = True
         self._cp_group = process_group

@@ -41,10 +41,6 @@ def split_inputs_cp(x: Tensor, seq_dim: int, cp_group: ProcessGroup) -> Tensor:
     Raises:
         AssertionError: If the sequence dimension is not divisible by the number of ranks.
     """
-    # Ensure tensor is on CUDA
-    if x.device.type != "cuda":
-        x = x.cuda()
-
     cp_ranks = get_process_group_ranks(cp_group)
     cp_size = len(cp_ranks)
 
@@ -141,15 +137,19 @@ def robust_broadcast(tensor: torch.Tensor, src: int, pg: ProcessGroup, is_check_
     Returns:
         torch.Tensor: The broadcasted tensor on all ranks.
     """
-    # Ensure tensor is on CUDA
-    if tensor.device.type != "cuda":
-        tensor = tensor.cuda()
-
     # First, broadcast the shape of the tensor
     if distributed.get_rank() == src:
-        shape = torch.tensor(tensor.shape).cuda()
+        shape = torch.tensor(
+            tensor.shape,
+            dtype=torch.long,
+            device=tensor.device,
+        )
     else:
-        shape = torch.empty(tensor.dim(), dtype=torch.long).cuda()
+        shape = torch.empty(
+            tensor.dim(),
+            dtype=torch.long,
+            device=tensor.device,
+        )
     if is_check_shape:
         _verify_param_shape_across_processes(pg, [shape])
     torch.distributed.broadcast(shape, src, group=pg)
@@ -173,9 +173,6 @@ def broadcast(item: torch.Tensor | str | None, process_group: ProcessGroup | Non
 
     min_rank = min(get_process_group_ranks(process_group))
     if isinstance(item, torch.Tensor):
-        # Ensure tensor is on CUDA before broadcasting
-        if item.device.type != "cuda":
-            item = item.cuda()
         item = robust_broadcast(item, min_rank, process_group)
     elif item is not None:
         broadcastable_list = [item]
