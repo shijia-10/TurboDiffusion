@@ -94,6 +94,17 @@ def test_rope_apply_uses_bnsd_layout():
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=0)
 
 
+def test_wan_rms_norm_preserves_bfloat16_activation_dtype():
+    wan2pt2 = importlib.import_module("rcm.networks.wan2pt2")
+    norm = wan2pt2.WanRMSNorm(4)
+    x = torch.tensor([[[1.0, 2.0, 3.0, 4.0]]], dtype=torch.bfloat16)
+
+    output = norm(x)
+
+    assert norm.weight.dtype == torch.float32
+    assert output.dtype == x.dtype
+
+
 @pytest.mark.parametrize("attention_class", ["WanSelfAttention", "WanCrossAttention"])
 def test_wan_attention_bnsd_calls_local_backend_and_restores_bsc(attention_class):
     wan2pt2 = importlib.import_module("rcm.networks.wan2pt2")
