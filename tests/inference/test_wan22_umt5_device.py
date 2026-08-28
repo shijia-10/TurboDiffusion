@@ -47,6 +47,45 @@ def test_umt5_checkpoint_is_loaded_on_npu_by_default(monkeypatch):
     assert model.loaded_state == (checkpoint, True)
 
 
+def test_umt5_checkpoint_can_load_locally_without_world_sync(monkeypatch):
+    umt5 = importlib.import_module("rcm.utils.umt5")
+    checkpoint = {"encoder.weight": torch.tensor([1.0])}
+    events = []
+
+    class FakeModel:
+        def __init__(self):
+            self.loaded_state = None
+
+        def load_state_dict(self, state, assign):
+            self.loaded_state = (state, assign)
+
+    monkeypatch.setattr(umt5.distributed, "is_rank0", lambda: False)
+    monkeypatch.setattr(
+        umt5.easy_io,
+        "load",
+        lambda path, map_location: events.append(
+            ("load", path, map_location)
+        )
+        or checkpoint,
+    )
+    monkeypatch.setattr(
+        umt5.distributed,
+        "sync_model_states",
+        lambda *args, **kwargs: events.append(("sync", args, kwargs)),
+    )
+    model = FakeModel()
+
+    result = umt5.load_model_torch(
+        model,
+        "umt5.pth",
+        sync_distributed_states=False,
+    )
+
+    assert result is model
+    assert model.loaded_state == (checkpoint, True)
+    assert events == [("load", "umt5.pth", "npu")]
+
+
 def test_get_umt5_embedding_uses_npu_by_default(monkeypatch):
     umt5 = importlib.import_module("rcm.utils.umt5")
     events = []

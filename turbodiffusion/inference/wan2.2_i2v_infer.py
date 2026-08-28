@@ -172,6 +172,54 @@ def enable_ulysses(models, ulysses_group) -> None:
         model.enable_context_parallel(ulysses_group)
 
 
+def prepare_text_embedding(
+    checkpoint_path: str,
+    prompt: str,
+    rank: int,
+    ulysses_group,
+) -> torch.Tensor:
+    """Compute UMT5 on rank 0 and share its embedding with all ranks."""
+    if ulysses_group is None:
+        with torch.no_grad():
+            text_emb = get_umt5_embedding(
+                checkpoint_path=checkpoint_path,
+                prompts=prompt,
+            ).to(**tensor_kwargs)
+        clear_umt5_memory()
+        return text_emb
+
+    if rank == 0:
+        with torch.no_grad():
+            text_emb = get_umt5_embedding(
+                checkpoint_path=checkpoint_path,
+                prompts=prompt,
+                device=tensor_kwargs["device"],
+                sync_distributed_states=False,
+            ).to(**tensor_kwargs)
+        clear_umt5_memory()
+        shape = torch.tensor(
+            text_emb.shape,
+            dtype=torch.long,
+            device=tensor_kwargs["device"],
+        )
+    else:
+        text_emb = None
+        shape = torch.empty(
+            3,
+            dtype=torch.long,
+            device=tensor_kwargs["device"],
+        )
+
+    torch.distributed.broadcast(shape, src=0, group=ulysses_group)
+    if rank != 0:
+        text_emb = torch.empty(
+            tuple(shape.tolist()),
+            **tensor_kwargs,
+        )
+    torch.distributed.broadcast(text_emb, src=0, group=ulysses_group)
+    return text_emb
+
+
 def sampling_progress(timesteps, rank: int):
     """Show the sampling progress bar on rank 0 only."""
     steps = list(zip(timesteps[:-1], timesteps[1:]))
@@ -261,10 +309,14 @@ if __name__ == "__main__":
         log.error("--image_path is required (unless using --serve mode)")
         exit(1)
 
-    log.info(f"Computing embedding for prompt: {args.prompt}")
-    with torch.no_grad():
-        text_emb = get_umt5_embedding(checkpoint_path=args.text_encoder_path, prompts=args.prompt).to(**tensor_kwargs)
-    clear_umt5_memory()
+    if rank == 0:
+        log.info(f"Computing embedding for prompt: {args.prompt}")
+    text_emb = prepare_text_embedding(
+        checkpoint_path=args.text_encoder_path,
+        prompt=args.prompt,
+        rank=rank,
+        ulysses_group=ulysses_group,
+    )
 
     log.info(f"Loading DiT models.")
     high_noise_model = create_model(dit_path=args.high_noise_model_path, args=args).cpu()

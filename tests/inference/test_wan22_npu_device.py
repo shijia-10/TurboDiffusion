@@ -285,6 +285,103 @@ def test_enable_ulysses_sets_same_group_on_both_noise_models(inference_module):
     assert events == [("high", group), ("low", group)]
 
 
+def test_rank0_computes_and_broadcasts_text_embedding(
+    inference_module,
+    monkeypatch,
+):
+    group = object()
+    expected = torch.arange(24, dtype=torch.bfloat16).view(1, 3, 8)
+    events = []
+
+    monkeypatch.setattr(
+        inference_module,
+        "get_umt5_embedding",
+        lambda **kwargs: events.append(("compute", kwargs)) or expected,
+    )
+    monkeypatch.setattr(
+        inference_module,
+        "clear_umt5_memory",
+        lambda: events.append(("clear",)),
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "broadcast",
+        lambda tensor, src, group: events.append(
+            ("broadcast", tuple(tensor.shape), src, group)
+        ),
+    )
+    inference_module.tensor_kwargs.clear()
+    inference_module.tensor_kwargs.update(
+        {"device": "cpu", "dtype": torch.bfloat16}
+    )
+
+    actual = inference_module.prepare_text_embedding(
+        checkpoint_path="umt5.pth",
+        prompt="a cat",
+        rank=0,
+        ulysses_group=group,
+    )
+
+    torch.testing.assert_close(actual, expected)
+    assert events == [
+        (
+            "compute",
+            {
+                "checkpoint_path": "umt5.pth",
+                "prompts": "a cat",
+                "device": "cpu",
+                "sync_distributed_states": False,
+            },
+        ),
+        ("clear",),
+        ("broadcast", (3,), 0, group),
+        ("broadcast", (1, 3, 8), 0, group),
+    ]
+
+
+def test_nonzero_rank_receives_text_embedding_without_loading_umt5(
+    inference_module,
+    monkeypatch,
+):
+    group = object()
+    expected = torch.arange(24, dtype=torch.bfloat16).view(1, 3, 8)
+    calls = []
+
+    monkeypatch.setattr(
+        inference_module,
+        "get_umt5_embedding",
+        lambda **kwargs: pytest.fail("nonzero rank loaded UMT5"),
+    )
+    monkeypatch.setattr(
+        inference_module,
+        "clear_umt5_memory",
+        lambda: pytest.fail("nonzero rank cleared UMT5"),
+    )
+
+    def fake_broadcast(tensor, src, group):
+        calls.append((tuple(tensor.shape), src, group))
+        if len(calls) == 1:
+            tensor.copy_(torch.tensor(expected.shape, dtype=torch.long))
+        else:
+            tensor.copy_(expected)
+
+    monkeypatch.setattr(torch.distributed, "broadcast", fake_broadcast)
+    inference_module.tensor_kwargs.clear()
+    inference_module.tensor_kwargs.update(
+        {"device": "cpu", "dtype": torch.bfloat16}
+    )
+
+    actual = inference_module.prepare_text_embedding(
+        checkpoint_path="umt5.pth",
+        prompt="a cat",
+        rank=7,
+        ulysses_group=group,
+    )
+
+    torch.testing.assert_close(actual, expected)
+    assert calls == [((3,), 0, group), ((1, 3, 8), 0, group)]
+
+
 def test_nonzero_rank_skips_video_decode_and_save(inference_module):
     class Tokenizer:
         def decode(self, samples):

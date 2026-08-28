@@ -465,15 +465,20 @@ def umt5_xxl(**kwargs):
     return _t5("umt5-xxl", **cfg)
 
 
-def load_model_torch(model, ckpt_path):
-    if distributed.is_rank0():
+def load_model_torch(
+    model,
+    ckpt_path,
+    sync_distributed_states: bool = True,
+):
+    if not sync_distributed_states or distributed.is_rank0():
         ckpt = easy_io.load(
             ckpt_path,
             map_location="npu",
         )
         model.load_state_dict(ckpt, assign=True)
 
-    distributed.sync_model_states(model, src=0)
+    if sync_distributed_states:
+        distributed.sync_model_states(model, src=0)
     return model
 
 
@@ -485,6 +490,7 @@ class UMT5EncoderModel:
         device="npu",
         checkpoint_path="models_t5_umt5-xxl-enc-bf16.pth",
         tokenizer_path="google/umt5-xxl",
+        sync_distributed_states: bool = True,
     ):
         self.text_len = text_len
         self.dtype = dtype
@@ -494,7 +500,11 @@ class UMT5EncoderModel:
         model = umt5_xxl(encoder_only=True, dtype=dtype, device='meta')
         log.info(f"loading {checkpoint_path}")
         assert checkpoint_path.endswith(".pth")
-        self.model = load_model_torch(model, checkpoint_path).to(device).eval()
+        self.model = load_model_torch(
+            model,
+            checkpoint_path,
+            sync_distributed_states=sync_distributed_states,
+        ).to(device).eval()
         # init tokenizer
         self.tokenizer = HuggingfaceTokenizer(name=tokenizer_path, seq_len=text_len, clean="whitespace")
 
@@ -526,8 +536,17 @@ def get_umt5_embedding(
     prompts: Union[str, List[str]],
     device: str = "npu",
     max_length: int = 512,
+    sync_distributed_states: bool = True,
 ) -> torch.Tensor:
     global t5_encoder
+    if not sync_distributed_states:
+        encoder = UMT5EncoderModel(
+            text_len=max_length,
+            device=device,
+            checkpoint_path=checkpoint_path,
+            sync_distributed_states=False,
+        )
+        return encoder(prompts, device=device)
     if t5_encoder is None:
         t5_encoder = UMT5EncoderModel(text_len=max_length, device=device, checkpoint_path=checkpoint_path)
     return t5_encoder(prompts, device=device)
