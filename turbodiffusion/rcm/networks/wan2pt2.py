@@ -16,6 +16,7 @@
 # from Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 
 import math
+import os
 from typing import Optional
 
 import torch
@@ -34,6 +35,11 @@ from rcm.utils.context_parallel import split_inputs_cp, cat_outputs_cp, cat_outp
 
 T5_CONTEXT_TOKEN_NUMBER = 512
 FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER = 257 * 2
+
+FAST_LAYERNORM = int(os.getenv("FAST_LAYERNORM", "0"))
+if FAST_LAYERNORM == 1:
+    from mindiesd import fast_layernorm
+    print(f"FAST_LAYERNORM enabled!")
 
 
 def mindie_dense_attention(q, k, v):
@@ -369,14 +375,27 @@ class WanAttentionBlock(nn.Module):
         assert e[0].dtype == torch.float32
 
         # self-attention
-        y = self.self_attn((self.norm1(x).float() * (1 + e[1]) + e[0]).type_as(x), seq_lens, freqs)
+        if FAST_LAYERNORM == 1:
+            norm1_out = fast_layernorm(self.norm1, x)
+        else:
+            norm1_out = self.norm1(x)
+        y = self.self_attn((norm1_out.float() * (1 + e[1]) + e[0]).type_as(x), seq_lens, freqs)
         with amp.autocast("npu", dtype=torch.float32):
             x = x + y * e[2].type_as(x)
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
-            x = x + self.cross_attn(self.norm3(x), context, context_lens)
-            y = self.ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).type_as(x))
+            if FAST_LAYERNORM == 1:
+                norm3_out = fast_layernorm(self.norm3, x)
+            else:
+                norm3_out = self.norm3(x)
+            x = x + self.cross_attn(norm3_out, context, context_lens)
+
+            if FAST_LAYERNORM == 1:
+                norm2_out = fast_layernorm(self.norm2, x)
+            else:
+                norm2_out = self.norm2(x)
+            y = self.ffn((norm2_out.float() * (1 + e[4]) + e[3]).type_as(x))
             with amp.autocast("npu", dtype=torch.float32):
                 x = x + y * e[5].type_as(x)
             return x

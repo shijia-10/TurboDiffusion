@@ -36,7 +36,7 @@ def test_single_npu_script_invokes_non_quantized_sla_inference(tmp_path):
         fake_bin / "python",
         "#!/bin/sh\n"
         "printf '%s\\n' \"$@\" > \"$CAPTURE_ARGS\"\n"
-        "printf 'ASCEND_RT_VISIBLE_DEVICES=%s\\nPYTHONPATH=%s\\n' \"$ASCEND_RT_VISIBLE_DEVICES\" \"$PYTHONPATH\" > \"$CAPTURE_ENV\"\n",
+        "printf 'ASCEND_RT_VISIBLE_DEVICES=%s\\nPYTHONPATH=%s\\nFAST_LAYERNORM=%s\\n' \"$ASCEND_RT_VISIBLE_DEVICES\" \"$PYTHONPATH\" \"$FAST_LAYERNORM\" > \"$CAPTURE_ENV\"\n",
     )
 
     output_path = tmp_path / "output" / "sla.mp4"
@@ -73,6 +73,7 @@ def test_single_npu_script_invokes_non_quantized_sla_inference(tmp_path):
     assert "--quant_linear" not in args
     assert output_path.parent.is_dir()
     assert "ASCEND_RT_VISIBLE_DEVICES=3" in capture_env.read_text()
+    assert "FAST_LAYERNORM=1" in capture_env.read_text()
 
 
 def test_single_npu_script_rejects_unsupported_attention_type():

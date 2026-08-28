@@ -50,12 +50,14 @@ export PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:Tru
 export TASK_QUEUE_ENABLE="${TASK_QUEUE_ENABLE:-2}"
 export CPU_AFFINITY_CONF="${CPU_AFFINITY_CONF:-1}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export FAST_LAYERNORM="${FAST_LAYERNORM:-1}"
 
 mkdir -p "$(dirname "${SAVE_PATH}")"
 
 echo "Running Wan2.2 I2V single-NPU inference"
 echo "  physical NPU: ${NPU_ID}"
 echo "  attention:    ${ATTENTION_TYPE}"
+echo "  fast norm:    ${FAST_LAYERNORM}"
 echo "  input:        ${IMAGE_PATH}"
 echo "  output:       ${SAVE_PATH}"
 

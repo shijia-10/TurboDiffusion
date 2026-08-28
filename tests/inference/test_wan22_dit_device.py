@@ -1,4 +1,5 @@
 import ast
+from contextlib import nullcontext
 import importlib
 import math
 from pathlib import Path
@@ -39,6 +40,12 @@ class CaptureLocalAttention(torch.nn.Module):
     def forward(self, q, k, v):
         self.seen = (tuple(q.shape), tuple(k.shape), tuple(v.shape))
         return q
+
+
+class ReturnZeros(torch.nn.Module):
+    def forward(self, x, *args, **kwargs):
+        del args, kwargs
+        return torch.zeros_like(x)
 
 
 def test_rope_cache_parameters_are_created_on_npu(monkeypatch):
@@ -103,6 +110,57 @@ def test_wan_rms_norm_preserves_bfloat16_activation_dtype():
 
     assert norm.weight.dtype == torch.float32
     assert output.dtype == x.dtype
+
+
+@pytest.mark.parametrize("enabled, expected_call_count", [(0, 0), (1, 3)])
+def test_fast_layernorm_switch_controls_attention_block_norms(
+    monkeypatch,
+    enabled,
+    expected_call_count,
+):
+    wan2pt2 = importlib.import_module("rcm.networks.wan2pt2")
+    calls = []
+
+    def fake_fast_layernorm(norm, x):
+        calls.append(norm)
+        return norm(x)
+
+    monkeypatch.setattr(wan2pt2, "FAST_LAYERNORM", enabled, raising=False)
+    monkeypatch.setattr(
+        wan2pt2,
+        "fast_layernorm",
+        fake_fast_layernorm,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        wan2pt2.amp,
+        "autocast",
+        lambda *args, **kwargs: nullcontext(),
+    )
+    block = wan2pt2.WanAttentionBlock(
+        "i2v_cross_attn",
+        dim=4,
+        ffn_dim=8,
+        num_heads=1,
+        cross_attn_norm=True,
+    )
+    block.self_attn = ReturnZeros()
+    block.cross_attn = ReturnZeros()
+    block.ffn = ReturnZeros()
+
+    output = block(
+        x=torch.randn(1, 2, 4),
+        e=torch.zeros(1, 6, 4),
+        seq_lens=torch.tensor([2]),
+        freqs=torch.zeros(2, 2),
+        context=torch.randn(1, 3, 4),
+        context_lens=None,
+    )
+
+    assert output.shape == (1, 2, 4)
+    assert len(calls) == expected_call_count
+    if enabled:
+        assert calls == [block.norm1, block.norm3, block.norm2]
 
 
 @pytest.mark.parametrize("attention_class", ["WanSelfAttention", "WanCrossAttention"])
