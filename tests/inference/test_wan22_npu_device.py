@@ -16,7 +16,7 @@ def inference_module(monkeypatch):
     io_module = types.ModuleType("imaginaire.utils.io")
     io_module.save_image_or_video = lambda *args, **kwargs: None
     utils_module = types.ModuleType("imaginaire.utils")
-    utils_module.log = object()
+    utils_module.log = types.SimpleNamespace(info=lambda *args, **kwargs: None)
     monkeypatch.setitem(sys.modules, "imaginaire.utils", utils_module)
     monkeypatch.setitem(sys.modules, "imaginaire.utils.io", io_module)
 
@@ -128,18 +128,16 @@ def test_i2v_cli_exposes_only_ulysses_parallel_degree(
     assert not hasattr(args, "distributed_backend")
 
 
-def test_initialize_ulysses_npu_binds_local_rank_and_initializes_hccl(
+def test_bind_ulysses_npu_binds_local_rank_without_initializing_hccl(
     inference_module,
     monkeypatch,
 ):
     events = []
-    world_group = object()
     fake_npu = types.SimpleNamespace(
         is_available=lambda: True,
         set_device=lambda device_id: events.append(("set_device", device_id)),
     )
     fake_dist = types.SimpleNamespace(
-        group=types.SimpleNamespace(WORLD=world_group),
         init_process_group=lambda **kwargs: events.append(
             ("init_process_group", kwargs)
         ),
@@ -153,21 +151,39 @@ def test_initialize_ulysses_npu_binds_local_rank_and_initializes_hccl(
     monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
     monkeypatch.setenv("MASTER_PORT", "29500")
 
-    tensor_config, rank, group = inference_module.initialize_ulysses_npu(8)
+    tensor_config, rank = inference_module.bind_ulysses_npu(8)
 
     assert tensor_config == {"device": "npu:3", "dtype": torch.bfloat16}
     assert rank == 3
+    assert events == [("set_device", 3)]
+
+
+def test_initialize_ulysses_group_initializes_hccl_after_device_binding(
+    inference_module,
+    monkeypatch,
+):
+    events = []
+    world_group = object()
+    fake_dist = types.SimpleNamespace(
+        group=types.SimpleNamespace(WORLD=world_group),
+        init_process_group=lambda **kwargs: events.append(
+            ("init_process_group", kwargs)
+        ),
+    )
+    monkeypatch.setattr(torch, "distributed", fake_dist)
+
+    group = inference_module.initialize_ulysses_group(rank=3)
+
     assert group is world_group
     assert events == [
-        ("set_device", 3),
         (
             "init_process_group",
             {"backend": "hccl", "init_method": "env://"},
-        ),
+        )
     ]
 
 
-def test_initialize_ulysses_npu_rejects_world_size_mismatch_before_npu_setup(
+def test_bind_ulysses_npu_rejects_world_size_mismatch_before_npu_setup(
     inference_module,
     monkeypatch,
 ):
@@ -187,7 +203,7 @@ def test_initialize_ulysses_npu_rejects_world_size_mismatch_before_npu_setup(
     monkeypatch.setenv("WORLD_SIZE", "8")
 
     with pytest.raises(ValueError, match="ulysses_size.*WORLD_SIZE"):
-        inference_module.initialize_ulysses_npu(4)
+        inference_module.bind_ulysses_npu(4)
 
     assert events == []
 
@@ -196,15 +212,13 @@ def test_initialize_inference_npu_selects_ulysses_for_torchrun_world(
     inference_module,
     monkeypatch,
 ):
-    world_group = object()
     monkeypatch.setenv("WORLD_SIZE", "8")
     monkeypatch.setattr(
         inference_module,
-        "initialize_ulysses_npu",
+        "bind_ulysses_npu",
         lambda size: (
             {"device": "npu:6", "dtype": torch.bfloat16},
             6,
-            world_group,
         ),
         raising=False,
     )
@@ -215,12 +229,12 @@ def test_initialize_inference_npu_selects_ulysses_for_torchrun_world(
     )
     inference_module.tensor_kwargs.clear()
 
-    rank, group = inference_module.initialize_inference_npu(
+    rank, use_ulysses = inference_module.initialize_inference_npu(
         types.SimpleNamespace(ulysses_size=8, device_id=0)
     )
 
     assert rank == 6
-    assert group is world_group
+    assert use_ulysses is True
     assert inference_module.tensor_kwargs == {
         "device": "npu:6",
         "dtype": torch.bfloat16,
@@ -285,7 +299,7 @@ def test_enable_ulysses_sets_same_group_on_both_noise_models(inference_module):
     assert events == [("high", group), ("low", group)]
 
 
-def test_rank0_computes_and_broadcasts_text_embedding(
+def test_rank0_computes_umt5_before_initializing_hccl_and_broadcasting(
     inference_module,
     monkeypatch,
 ):
@@ -304,6 +318,19 @@ def test_rank0_computes_and_broadcasts_text_embedding(
         lambda: events.append(("clear",)),
     )
     monkeypatch.setattr(
+        torch,
+        "npu",
+        types.SimpleNamespace(
+            synchronize=lambda: events.append(("synchronize",))
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        inference_module,
+        "initialize_ulysses_group",
+        lambda rank: events.append(("init_hccl", rank)) or group,
+    )
+    monkeypatch.setattr(
         torch.distributed,
         "broadcast",
         lambda tensor, src, group: events.append(
@@ -315,14 +342,14 @@ def test_rank0_computes_and_broadcasts_text_embedding(
         {"device": "cpu", "dtype": torch.bfloat16}
     )
 
-    actual = inference_module.prepare_text_embedding(
+    actual, actual_group = inference_module.prepare_parallel_text_embedding(
         checkpoint_path="umt5.pth",
         prompt="a cat",
         rank=0,
-        ulysses_group=group,
     )
 
     torch.testing.assert_close(actual, expected)
+    assert actual_group is group
     assert events == [
         (
             "compute",
@@ -333,13 +360,15 @@ def test_rank0_computes_and_broadcasts_text_embedding(
                 "sync_distributed_states": False,
             },
         ),
+        ("synchronize",),
         ("clear",),
+        ("init_hccl", 0),
         ("broadcast", (3,), 0, group),
         ("broadcast", (1, 3, 8), 0, group),
     ]
 
 
-def test_nonzero_rank_receives_text_embedding_without_loading_umt5(
+def test_nonzero_rank_initializes_hccl_without_loading_umt5(
     inference_module,
     monkeypatch,
 ):
@@ -357,10 +386,15 @@ def test_nonzero_rank_receives_text_embedding_without_loading_umt5(
         "clear_umt5_memory",
         lambda: pytest.fail("nonzero rank cleared UMT5"),
     )
+    monkeypatch.setattr(
+        inference_module,
+        "initialize_ulysses_group",
+        lambda rank: calls.append(("init_hccl", rank)) or group,
+    )
 
     def fake_broadcast(tensor, src, group):
-        calls.append((tuple(tensor.shape), src, group))
-        if len(calls) == 1:
+        calls.append(("broadcast", tuple(tensor.shape), src, group))
+        if len(calls) == 2:
             tensor.copy_(torch.tensor(expected.shape, dtype=torch.long))
         else:
             tensor.copy_(expected)
@@ -371,15 +405,19 @@ def test_nonzero_rank_receives_text_embedding_without_loading_umt5(
         {"device": "cpu", "dtype": torch.bfloat16}
     )
 
-    actual = inference_module.prepare_text_embedding(
+    actual, actual_group = inference_module.prepare_parallel_text_embedding(
         checkpoint_path="umt5.pth",
         prompt="a cat",
         rank=7,
-        ulysses_group=group,
     )
 
     torch.testing.assert_close(actual, expected)
-    assert calls == [((3,), 0, group), ((1, 3, 8), 0, group)]
+    assert actual_group is group
+    assert calls == [
+        ("init_hccl", 7),
+        ("broadcast", (3,), 0, group),
+        ("broadcast", (1, 3, 8), 0, group),
+    ]
 
 
 def test_nonzero_rank_skips_video_decode_and_save(inference_module):

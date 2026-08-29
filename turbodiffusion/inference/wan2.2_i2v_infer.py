@@ -51,8 +51,8 @@ def initialize_npu(device_id: int) -> dict:
     return {"device": f"npu:{device_id}", "dtype": torch.bfloat16}
 
 
-def initialize_ulysses_npu(ulysses_size: int) -> tuple[dict, int, object]:
-    """Bind the torchrun local NPU and initialize the HCCL Ulysses group."""
+def bind_ulysses_npu(ulysses_size: int) -> tuple[dict, int]:
+    """Validate torchrun metadata and bind this rank's local NPU."""
     try:
         import torch_npu
     except ImportError as exc:
@@ -88,31 +88,34 @@ def initialize_ulysses_npu(ulysses_size: int) -> tuple[dict, int, object]:
         raise RuntimeError("No available Ascend NPU was detected")
 
     torch.npu.set_device(local_rank)
+    return {"device": f"npu:{local_rank}", "dtype": torch.bfloat16}, rank
+
+
+def initialize_ulysses_group(rank: int):
+    """Initialize HCCL after rank 0 has completed UMT5 inference."""
+    log.info(f"[rank={rank}] HCCL initialization begin")
     torch.distributed.init_process_group(backend="hccl", init_method="env://")
-    return (
-        {"device": f"npu:{local_rank}", "dtype": torch.bfloat16},
-        rank,
-        torch.distributed.group.WORLD,
-    )
+    group = torch.distributed.group.WORLD
+    log.info(f"[rank={rank}] HCCL initialization end")
+    return group
 
 
-def initialize_inference_npu(args: argparse.Namespace) -> tuple[int, object | None]:
-    """Select the single-NPU or torchrun Ulysses initialization path."""
+def initialize_inference_npu(args: argparse.Namespace) -> tuple[int, bool]:
+    """Bind the selected NPU without starting HCCL before UMT5."""
     try:
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
     except ValueError as exc:
         raise ValueError("WORLD_SIZE must be an integer") from exc
 
     if world_size > 1 or args.ulysses_size > 1:
-        placement, rank, ulysses_group = initialize_ulysses_npu(
-            args.ulysses_size
-        )
+        placement, rank = bind_ulysses_npu(args.ulysses_size)
+        use_ulysses = True
     else:
         placement = initialize_npu(args.device_id)
         rank = 0
-        ulysses_group = None
+        use_ulysses = False
     tensor_kwargs.update(placement)
-    return rank, ulysses_group
+    return rank, use_ulysses
 
 """Make slight adjustments to H and W so that the final S is evenly divisible by the Ulysses size."""
 def align_resolution_for_ulysses(
@@ -175,28 +178,27 @@ def enable_ulysses(models, ulysses_group) -> None:
 def prepare_text_embedding(
     checkpoint_path: str,
     prompt: str,
-    rank: int,
-    ulysses_group,
+    sync_distributed_states: bool = True,
 ) -> torch.Tensor:
-    """Compute UMT5 on rank 0 and share its embedding with all ranks."""
-    if ulysses_group is None:
-        with torch.no_grad():
-            text_emb = get_umt5_embedding(
-                checkpoint_path=checkpoint_path,
-                prompts=prompt,
-            ).to(**tensor_kwargs)
-        clear_umt5_memory()
-        return text_emb
+    """Compute one text embedding on the already-bound local NPU."""
+    log.info("[rank=0] UMT5 embedding begin")
+    with torch.no_grad():
+        text_emb = get_umt5_embedding(
+            checkpoint_path=checkpoint_path,
+            prompts=prompt,
+            device=tensor_kwargs["device"],
+            sync_distributed_states=sync_distributed_states,
+        ).to(**tensor_kwargs)
+    torch.npu.synchronize()
+    clear_umt5_memory()
+    log.info("[rank=0] UMT5 embedding end")
+    return text_emb
 
+
+def broadcast_text_embedding(text_emb, rank: int, ulysses_group) -> torch.Tensor:
+    """Broadcast the rank-0 UMT5 result after HCCL is initialized."""
+    log.info(f"[rank={rank}] text embedding broadcast begin")
     if rank == 0:
-        with torch.no_grad():
-            text_emb = get_umt5_embedding(
-                checkpoint_path=checkpoint_path,
-                prompts=prompt,
-                device=tensor_kwargs["device"],
-                sync_distributed_states=False,
-            ).to(**tensor_kwargs)
-        clear_umt5_memory()
         shape = torch.tensor(
             text_emb.shape,
             dtype=torch.long,
@@ -217,7 +219,26 @@ def prepare_text_embedding(
             **tensor_kwargs,
         )
     torch.distributed.broadcast(text_emb, src=0, group=ulysses_group)
+    log.info(f"[rank={rank}] text embedding broadcast end")
     return text_emb
+
+
+def prepare_parallel_text_embedding(
+    checkpoint_path: str,
+    prompt: str,
+    rank: int,
+) -> tuple[torch.Tensor, object]:
+    """Run rank-0 UMT5 before HCCL, then distribute its embedding."""
+    text_emb = None
+    if rank == 0:
+        text_emb = prepare_text_embedding(
+            checkpoint_path=checkpoint_path,
+            prompt=prompt,
+            sync_distributed_states=False,
+        )
+    ulysses_group = initialize_ulysses_group(rank)
+    text_emb = broadcast_text_embedding(text_emb, rank, ulysses_group)
+    return text_emb, ulysses_group
 
 
 def sampling_progress(timesteps, rank: int):
@@ -291,7 +312,8 @@ def parse_arguments() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_arguments()
-    rank, ulysses_group = initialize_inference_npu(args)
+    rank, use_ulysses = initialize_inference_npu(args)
+    ulysses_group = None
 
     # Handle serve mode
     if args.serve:
@@ -309,14 +331,17 @@ if __name__ == "__main__":
         log.error("--image_path is required (unless using --serve mode)")
         exit(1)
 
-    if rank == 0:
-        log.info(f"Computing embedding for prompt: {args.prompt}")
-    text_emb = prepare_text_embedding(
-        checkpoint_path=args.text_encoder_path,
-        prompt=args.prompt,
-        rank=rank,
-        ulysses_group=ulysses_group,
-    )
+    if use_ulysses:
+        text_emb, ulysses_group = prepare_parallel_text_embedding(
+            checkpoint_path=args.text_encoder_path,
+            prompt=args.prompt,
+            rank=rank,
+        )
+    else:
+        text_emb = prepare_text_embedding(
+            checkpoint_path=args.text_encoder_path,
+            prompt=args.prompt,
+        )
 
     log.info(f"Loading DiT models.")
     high_noise_model = create_model(dit_path=args.high_noise_model_path, args=args).cpu()
