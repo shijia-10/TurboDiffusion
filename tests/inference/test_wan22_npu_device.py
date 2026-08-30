@@ -128,6 +128,82 @@ def test_i2v_cli_exposes_only_ulysses_parallel_degree(
     assert not hasattr(args, "distributed_backend")
 
 
+def test_i2v_cli_stage_profiling_is_opt_in(inference_module, monkeypatch):
+    base_args = [
+        "wan2.2_i2v_infer.py",
+        "--high_noise_model_path",
+        "high.pth",
+        "--low_noise_model_path",
+        "low.pth",
+    ]
+    monkeypatch.setattr(sys, "argv", base_args)
+    assert inference_module.parse_arguments().profile_stages is False
+
+    monkeypatch.setattr(sys, "argv", base_args + ["--profile-stages"])
+    assert inference_module.parse_arguments().profile_stages is True
+
+
+def test_synchronized_time_only_synchronizes_when_enabled(
+    inference_module,
+    monkeypatch,
+):
+    events = []
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        types.SimpleNamespace(
+            synchronize=lambda: events.append("synchronize")
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        inference_module.time,
+        "perf_counter",
+        lambda: events.append("clock") or 12.5,
+    )
+
+    assert inference_module.synchronized_time(enabled=False) is None
+    assert events == []
+    assert inference_module.synchronized_time(enabled=True) == 12.5
+    assert events == ["synchronize", "clock"]
+
+
+def test_sampling_profile_is_logged_only_by_rank0(
+    inference_module,
+    monkeypatch,
+):
+    messages = []
+    monkeypatch.setattr(
+        inference_module.log,
+        "info",
+        lambda message: messages.append(message),
+    )
+
+    inference_module.log_sampling_profile(
+        enabled=True,
+        rank=3,
+        step_index=0,
+        switch_seconds=1.0,
+        dit_seconds=2.0,
+        update_seconds=0.5,
+        total_seconds=4.0,
+    )
+    inference_module.log_sampling_profile(
+        enabled=True,
+        rank=0,
+        step_index=2,
+        switch_seconds=1.0,
+        dit_seconds=2.0,
+        update_seconds=0.5,
+        total_seconds=4.0,
+    )
+
+    assert messages == [
+        "Sampling profile: step=2 switch=1.0000s "
+        "dit=2.0000s update=0.5000s other=0.5000s total=4.0000s"
+    ]
+
+
 def test_bind_ulysses_npu_binds_local_rank_without_initializing_hccl(
     inference_module,
     monkeypatch,
