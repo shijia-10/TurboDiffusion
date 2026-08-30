@@ -11,6 +11,34 @@ import torch
 SCRIPT_PATH = Path(__file__).parents[2] / "turbodiffusion/inference/wan2.2_i2v_infer.py"
 
 
+def _sampling_loop(tree):
+    return next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.For)
+        and isinstance(node.iter, ast.Call)
+        and isinstance(node.iter.func, ast.Name)
+        and node.iter.func.id == "enumerate"
+        and isinstance(node.iter.args[0], ast.Call)
+        and isinstance(node.iter.args[0].func, ast.Name)
+        and node.iter.args[0].func.id == "sampling_progress"
+    )
+
+
+def _model_transfer_calls(nodes):
+    model_names = {"high_noise_model", "low_noise_model"}
+    return [
+        node
+        for parent in nodes
+        for node in ast.walk(parent)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id in model_names
+        and node.func.attr in {"to", "cpu"}
+    ]
+
+
 @pytest.fixture
 def inference_module(monkeypatch):
     io_module = types.ModuleType("imaginaire.utils.io")
@@ -202,6 +230,47 @@ def test_sampling_profile_is_logged_only_by_rank0(
         "Sampling profile: step=2 switch=1.0000s "
         "dit=2.0000s update=0.5000s other=0.5000s total=4.0000s"
     ]
+
+
+def test_sampling_preloads_both_noise_models_before_progress():
+    tree = ast.parse(SCRIPT_PATH.read_text())
+    loop = _sampling_loop(tree)
+    calls = [
+        node
+        for node in _model_transfer_calls([tree])
+        if loop.lineno - 10 <= node.lineno < loop.lineno
+    ]
+
+    device_transfers = {
+        node.func.value.id
+        for node in calls
+        if node.func.attr == "to"
+    }
+    assert device_transfers == {"high_noise_model", "low_noise_model"}
+
+
+def test_sampling_switch_does_not_transfer_noise_models():
+    tree = ast.parse(SCRIPT_PATH.read_text())
+    loop = _sampling_loop(tree)
+
+    assert _model_transfer_calls(loop.body) == []
+
+
+def test_sampling_offloads_both_noise_models_after_progress():
+    tree = ast.parse(SCRIPT_PATH.read_text())
+    loop = _sampling_loop(tree)
+    calls = [
+        node
+        for node in _model_transfer_calls([tree])
+        if loop.end_lineno < node.lineno <= loop.end_lineno + 10
+    ]
+
+    cpu_transfers = {
+        node.func.value.id
+        for node in calls
+        if node.func.attr == "cpu"
+    }
+    assert cpu_transfers == {"high_noise_model", "low_noise_model"}
 
 
 def test_bind_ulysses_npu_binds_local_rank_without_initializing_hccl(

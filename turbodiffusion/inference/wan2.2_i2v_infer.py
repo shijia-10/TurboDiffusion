@@ -468,6 +468,7 @@ if __name__ == "__main__":
     x = init_noise.to(torch.float64) * t_steps[0]
     ones = torch.ones(x.size(0), 1, device=x.device, dtype=x.dtype)
     high_noise_model.to(tensor_kwargs["device"])
+    low_noise_model.to(tensor_kwargs["device"])
     net = high_noise_model
     switched = False
     for step_index, (t_cur, t_next) in enumerate(
@@ -477,9 +478,6 @@ if __name__ == "__main__":
         switch_seconds = 0.0
         if t_cur.item() < args.boundary and not switched:
             switch_start = synchronized_time(args.profile_stages)
-            high_noise_model.cpu()
-            torch.npu.empty_cache()
-            low_noise_model.to(tensor_kwargs["device"])
             net = low_noise_model
             switched = True
             if args.profile_stages:
@@ -514,6 +512,7 @@ if __name__ == "__main__":
                 total_seconds=step_end - step_start,
             )
     samples = x.float()
+    high_noise_model.cpu()
     low_noise_model.cpu()
     torch.npu.empty_cache()
 
