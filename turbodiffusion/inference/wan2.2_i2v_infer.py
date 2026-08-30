@@ -92,7 +92,7 @@ def bind_ulysses_npu(ulysses_size: int) -> tuple[dict, int]:
 
 
 def initialize_ulysses_group(rank: int):
-    """Initialize HCCL after rank 0 has completed UMT5 inference."""
+    """Initialize the HCCL Ulysses group on every rank."""
     log.info(f"[rank={rank}] HCCL initialization begin")
     torch.distributed.init_process_group(backend="hccl", init_method="env://")
     group = torch.distributed.group.WORLD
@@ -101,7 +101,7 @@ def initialize_ulysses_group(rank: int):
 
 
 def initialize_inference_npu(args: argparse.Namespace) -> tuple[int, bool]:
-    """Bind the selected NPU without starting HCCL before UMT5."""
+    """Bind the selected NPU and report whether Ulysses is enabled."""
     try:
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
     except ValueError as exc:
@@ -179,9 +179,10 @@ def prepare_text_embedding(
     checkpoint_path: str,
     prompt: str,
     sync_distributed_states: bool = True,
+    rank: int = 0,
 ) -> torch.Tensor:
     """Compute one text embedding on the already-bound local NPU."""
-    log.info("[rank=0] UMT5 embedding begin")
+    log.info(f"[rank={rank}] UMT5 embedding begin")
     with torch.no_grad():
         text_emb = get_umt5_embedding(
             checkpoint_path=checkpoint_path,
@@ -191,35 +192,7 @@ def prepare_text_embedding(
         ).to(**tensor_kwargs)
     torch.npu.synchronize()
     clear_umt5_memory()
-    log.info("[rank=0] UMT5 embedding end")
-    return text_emb
-
-
-def broadcast_text_embedding(text_emb, rank: int, ulysses_group) -> torch.Tensor:
-    """Broadcast the rank-0 UMT5 result after HCCL is initialized."""
-    log.info(f"[rank={rank}] text embedding broadcast begin")
-    if rank == 0:
-        shape = torch.tensor(
-            text_emb.shape,
-            dtype=torch.long,
-            device=tensor_kwargs["device"],
-        )
-    else:
-        text_emb = None
-        shape = torch.empty(
-            3,
-            dtype=torch.long,
-            device=tensor_kwargs["device"],
-        )
-
-    torch.distributed.broadcast(shape, src=0, group=ulysses_group)
-    if rank != 0:
-        text_emb = torch.empty(
-            tuple(shape.tolist()),
-            **tensor_kwargs,
-        )
-    torch.distributed.broadcast(text_emb, src=0, group=ulysses_group)
-    log.info(f"[rank={rank}] text embedding broadcast end")
+    log.info(f"[rank={rank}] UMT5 embedding end")
     return text_emb
 
 
@@ -228,16 +201,14 @@ def prepare_parallel_text_embedding(
     prompt: str,
     rank: int,
 ) -> tuple[torch.Tensor, object]:
-    """Run rank-0 UMT5 before HCCL, then distribute its embedding."""
-    text_emb = None
-    if rank == 0:
-        text_emb = prepare_text_embedding(
-            checkpoint_path=checkpoint_path,
-            prompt=prompt,
-            sync_distributed_states=False,
-        )
+    """Initialize HCCL, then compute the same UMT5 embedding on every rank."""
     ulysses_group = initialize_ulysses_group(rank)
-    text_emb = broadcast_text_embedding(text_emb, rank, ulysses_group)
+    text_emb = prepare_text_embedding(
+        checkpoint_path=checkpoint_path,
+        prompt=prompt,
+        sync_distributed_states=False,
+        rank=rank,
+    )
     return text_emb, ulysses_group
 
 

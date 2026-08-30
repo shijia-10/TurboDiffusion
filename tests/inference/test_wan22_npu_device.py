@@ -299,9 +299,11 @@ def test_enable_ulysses_sets_same_group_on_both_noise_models(inference_module):
     assert events == [("high", group), ("low", group)]
 
 
-def test_rank0_computes_umt5_before_initializing_hccl_and_broadcasting(
+@pytest.mark.parametrize("rank", [0, 7])
+def test_every_rank_initializes_hccl_before_computing_umt5_locally(
     inference_module,
     monkeypatch,
+    rank,
 ):
     group = object()
     expected = torch.arange(24, dtype=torch.bfloat16).view(1, 3, 8)
@@ -333,8 +335,8 @@ def test_rank0_computes_umt5_before_initializing_hccl_and_broadcasting(
     monkeypatch.setattr(
         torch.distributed,
         "broadcast",
-        lambda tensor, src, group: events.append(
-            ("broadcast", tuple(tensor.shape), src, group)
+        lambda *args, **kwargs: pytest.fail(
+            "symmetric UMT5 execution must not broadcast text embeddings"
         ),
     )
     inference_module.tensor_kwargs.clear()
@@ -345,12 +347,13 @@ def test_rank0_computes_umt5_before_initializing_hccl_and_broadcasting(
     actual, actual_group = inference_module.prepare_parallel_text_embedding(
         checkpoint_path="umt5.pth",
         prompt="a cat",
-        rank=0,
+        rank=rank,
     )
 
     torch.testing.assert_close(actual, expected)
     assert actual_group is group
     assert events == [
+        ("init_hccl", rank),
         (
             "compute",
             {
@@ -362,61 +365,6 @@ def test_rank0_computes_umt5_before_initializing_hccl_and_broadcasting(
         ),
         ("synchronize",),
         ("clear",),
-        ("init_hccl", 0),
-        ("broadcast", (3,), 0, group),
-        ("broadcast", (1, 3, 8), 0, group),
-    ]
-
-
-def test_nonzero_rank_initializes_hccl_without_loading_umt5(
-    inference_module,
-    monkeypatch,
-):
-    group = object()
-    expected = torch.arange(24, dtype=torch.bfloat16).view(1, 3, 8)
-    calls = []
-
-    monkeypatch.setattr(
-        inference_module,
-        "get_umt5_embedding",
-        lambda **kwargs: pytest.fail("nonzero rank loaded UMT5"),
-    )
-    monkeypatch.setattr(
-        inference_module,
-        "clear_umt5_memory",
-        lambda: pytest.fail("nonzero rank cleared UMT5"),
-    )
-    monkeypatch.setattr(
-        inference_module,
-        "initialize_ulysses_group",
-        lambda rank: calls.append(("init_hccl", rank)) or group,
-    )
-
-    def fake_broadcast(tensor, src, group):
-        calls.append(("broadcast", tuple(tensor.shape), src, group))
-        if len(calls) == 2:
-            tensor.copy_(torch.tensor(expected.shape, dtype=torch.long))
-        else:
-            tensor.copy_(expected)
-
-    monkeypatch.setattr(torch.distributed, "broadcast", fake_broadcast)
-    inference_module.tensor_kwargs.clear()
-    inference_module.tensor_kwargs.update(
-        {"device": "cpu", "dtype": torch.bfloat16}
-    )
-
-    actual, actual_group = inference_module.prepare_parallel_text_embedding(
-        checkpoint_path="umt5.pth",
-        prompt="a cat",
-        rank=7,
-    )
-
-    torch.testing.assert_close(actual, expected)
-    assert actual_group is group
-    assert calls == [
-        ("init_hccl", 7),
-        ("broadcast", (3,), 0, group),
-        ("broadcast", (1, 3, 8), 0, group),
     ]
 
 
