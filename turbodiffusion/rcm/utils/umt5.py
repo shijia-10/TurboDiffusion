@@ -27,7 +27,6 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer
 
 from imaginaire.utils import distributed, log, misc
-from imaginaire.utils.easy_io import easy_io
 
 
 def basic_clean(text):
@@ -471,9 +470,9 @@ def load_model_torch(
     sync_distributed_states: bool = True,
 ):
     if not sync_distributed_states or distributed.is_rank0():
-        ckpt = easy_io.load(
+        ckpt = torch.load(
             ckpt_path,
-            map_location="npu",
+            map_location="cpu",
         )
         model.load_state_dict(ckpt, assign=True)
 
