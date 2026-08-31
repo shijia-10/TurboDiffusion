@@ -15,7 +15,8 @@
 
 # from neophilia; Author: Qsh (qsh.zh27@gmail.com)
 
-from typing import Any, Callable, List, Tuple, Union
+import time
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -109,13 +110,89 @@ def single_all_to_all_bnsd(input: Tensor, scatter_heads: bool, group) -> Tensor:
     ).contiguous()
 
 
-def bnsd_ulysses_attention(query, key, value, local_attention, group):
+def bnsd_ulysses_attention(
+    query,
+    key,
+    value,
+    local_attention,
+    group,
+    profile_callback: Optional[Callable] = None,
+):
     """Run local BNSD attention between the two Ulysses All-to-All calls."""
-    query = single_all_to_all_bnsd(query, scatter_heads=True, group=group)
-    key = single_all_to_all_bnsd(key, scatter_heads=True, group=group)
-    value = single_all_to_all_bnsd(value, scatter_heads=True, group=group)
-    output = local_attention(query, key, value)
-    return single_all_to_all_bnsd(output, scatter_heads=False, group=group)
+    if profile_callback is None:
+        query = single_all_to_all_bnsd(query, scatter_heads=True, group=group)
+        key = single_all_to_all_bnsd(key, scatter_heads=True, group=group)
+        value = single_all_to_all_bnsd(value, scatter_heads=True, group=group)
+        output = local_attention(query, key, value)
+        return single_all_to_all_bnsd(
+            output,
+            scatter_heads=False,
+            group=group,
+        )
+
+    torch.npu.synchronize()
+    attention_start = time.perf_counter()
+
+    def timed_call(operation):
+        start = time.perf_counter()
+        output = operation()
+        torch.npu.synchronize()
+        return output, time.perf_counter() - start
+
+    query, q_seconds = timed_call(
+        lambda: single_all_to_all_bnsd(
+            query,
+            scatter_heads=True,
+            group=group,
+        )
+    )
+    key, k_seconds = timed_call(
+        lambda: single_all_to_all_bnsd(
+            key,
+            scatter_heads=True,
+            group=group,
+        )
+    )
+    value, v_seconds = timed_call(
+        lambda: single_all_to_all_bnsd(
+            value,
+            scatter_heads=True,
+            group=group,
+        )
+    )
+    output, sla_seconds = timed_call(
+        lambda: local_attention(query, key, value)
+    )
+    output, output_seconds = timed_call(
+        lambda: single_all_to_all_bnsd(
+            output,
+            scatter_heads=False,
+            group=group,
+        )
+    )
+
+    input_seconds = q_seconds + k_seconds + v_seconds
+    communication_seconds = input_seconds + output_seconds
+    attention_seconds = time.perf_counter() - attention_start
+    profile_callback(
+        {
+            "q_a2a": q_seconds,
+            "k_a2a": k_seconds,
+            "v_a2a": v_seconds,
+            "input_a2a": input_seconds,
+            "sla": sla_seconds,
+            "output_a2a": output_seconds,
+            "attention_total": attention_seconds,
+            "communication_ratio": (
+                communication_seconds / attention_seconds
+            ),
+            "hideable_per_block": min(
+                communication_seconds,
+                sla_seconds,
+            ),
+        }
+    )
+    return output
 
 
 def async_a2a_communicate(

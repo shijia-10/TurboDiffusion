@@ -24,7 +24,7 @@ import torch.amp as amp
 import torch.nn as nn
 from einops import rearrange, repeat
 
-from torch.distributed import ProcessGroup, get_process_group_ranks
+from torch.distributed import ProcessGroup, get_process_group_ranks, get_rank
 from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper as ptd_checkpoint_wrapper
 
@@ -37,6 +37,11 @@ T5_CONTEXT_TOKEN_NUMBER = 512
 FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER = 257 * 2
 
 FAST_LAYERNORM = int(os.getenv("FAST_LAYERNORM", "0"))
+ATTENTION_PROFILE_LAYERS = {
+    int(layer.strip())
+    for layer in os.getenv("PROFILE_ATTN_LAYERS", "").split(",")
+    if layer.strip()
+}
 if FAST_LAYERNORM == 1:
     from mindiesd import fast_layernorm
     print(f"FAST_LAYERNORM enabled!")
@@ -249,6 +254,9 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.attn_op = MinimalA2AAttnOp(local_attn=mindie_dense_attention)
+        self.layer_id = None
+        self.profile_total_layers = 1
+        self.profile_call_index = 0
 
     def init_weights(self):
         std = 1.0 / math.sqrt(self.dim)
@@ -298,16 +306,44 @@ class WanSelfAttention(nn.Module):
 
     def _apply_attention(self, q, k, v):
         if self.attn_op.pg is not None:
+            profile_callback = None
+            if self.layer_id in ATTENTION_PROFILE_LAYERS:
+                profile_callback = self._log_attention_profile
             output = bnsd_ulysses_attention(
                 q,
                 k,
                 v,
                 self.attn_op.local_attn,
                 self.attn_op.pg,
+                profile_callback=profile_callback,
             )
         else:
             output = self.attn_op.local_attn(q, k, v)
         return output.transpose(1, 2).contiguous()
+
+    def _log_attention_profile(self, profile):
+        call_index = self.profile_call_index
+        self.profile_call_index += 1
+        if get_rank(self.attn_op.pg) != 0:
+            return
+
+        projected_gain = (
+            profile["hideable_per_block"] * self.profile_total_layers
+        )
+        log.info(
+            f"Attention profile: layer={self.layer_id} "
+            f"call={call_index} "
+            f"q_a2a={profile['q_a2a'] * 1000:.3f}ms "
+            f"k_a2a={profile['k_a2a'] * 1000:.3f}ms "
+            f"v_a2a={profile['v_a2a'] * 1000:.3f}ms "
+            f"input_a2a={profile['input_a2a'] * 1000:.3f}ms "
+            f"sla={profile['sla'] * 1000:.3f}ms "
+            f"output_a2a={profile['output_a2a'] * 1000:.3f}ms "
+            f"total={profile['attention_total'] * 1000:.3f}ms "
+            f"comm_ratio={profile['communication_ratio']:.2%} "
+            f"hideable={profile['hideable_per_block'] * 1000:.3f}ms "
+            f"projected_gain={projected_gain:.4f}s"
+        )
 
 
 class WanCrossAttention(WanSelfAttention):
@@ -568,6 +604,9 @@ class WanModel(nn.Module):
         self.blocks = nn.ModuleList(
             [WanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads, qk_norm, cross_attn_norm, eps) for _ in range(num_layers)]
         )
+        for layer_id, block in enumerate(self.blocks):
+            block.self_attn.layer_id = layer_id
+            block.self_attn.profile_total_layers = num_layers
 
         # head
         self.head = Head(dim, out_dim, patch_size, eps)

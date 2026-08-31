@@ -2,6 +2,7 @@ import importlib
 import types
 import sys
 
+import pytest
 import torch
 
 
@@ -91,6 +92,111 @@ def test_bnsd_ulysses_exchanges_sequence_for_heads_and_restores_local_output(
 
     assert local_attention.seen == ((1, 2, 4, 1),) * 3
     assert output.shape == (1, 2, 4, 1)
+
+
+def test_profiled_bnsd_ulysses_reports_each_stage_and_communication_ratio(
+    monkeypatch,
+):
+    a2a_cp = importlib.import_module("rcm.utils.a2a_cp")
+    clock = [0.0]
+    a2a_calls = []
+    profiles = []
+
+    def synchronize():
+        clock[0] += 1.0
+
+    def fake_a2a(value, scatter_heads, group):
+        a2a_calls.append((value, scatter_heads, group))
+        return f"a2a({value})"
+
+    monkeypatch.setattr(
+        a2a_cp.torch,
+        "npu",
+        types.SimpleNamespace(synchronize=synchronize),
+        raising=False,
+    )
+    monkeypatch.setattr(a2a_cp.time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(a2a_cp, "single_all_to_all_bnsd", fake_a2a)
+
+    output = a2a_cp.bnsd_ulysses_attention(
+        "q",
+        "k",
+        "v",
+        lambda q, k, v: f"sla({q},{k},{v})",
+        group="ulysses",
+        profile_callback=profiles.append,
+    )
+
+    assert output == "a2a(sla(a2a(q),a2a(k),a2a(v)))"
+    assert a2a_calls == [
+        ("q", True, "ulysses"),
+        ("k", True, "ulysses"),
+        ("v", True, "ulysses"),
+        ("sla(a2a(q),a2a(k),a2a(v))", False, "ulysses"),
+    ]
+    assert profiles == [
+        {
+            "q_a2a": 1.0,
+            "k_a2a": 1.0,
+            "v_a2a": 1.0,
+            "input_a2a": 3.0,
+            "sla": 1.0,
+            "output_a2a": 1.0,
+            "attention_total": 5.0,
+            "communication_ratio": pytest.approx(0.8),
+            "hideable_per_block": 1.0,
+        }
+    ]
+
+
+def test_attention_profile_selects_only_configured_self_attention_layers(
+    monkeypatch,
+):
+    wan2pt2 = importlib.import_module("rcm.networks.wan2pt2")
+    profile_callbacks = []
+
+    def fake_ulysses(q, k, v, local_attention, group, profile_callback=None):
+        profile_callbacks.append(profile_callback)
+        return q
+
+    monkeypatch.setattr(wan2pt2, "ATTENTION_PROFILE_LAYERS", {20})
+    monkeypatch.setattr(wan2pt2, "bnsd_ulysses_attention", fake_ulysses)
+
+    unprofiled = wan2pt2.WanSelfAttention(dim=4, num_heads=1)
+    unprofiled.layer_id = 0
+    unprofiled.attn_op.pg = object()
+    profiled = wan2pt2.WanSelfAttention(dim=4, num_heads=1)
+    profiled.layer_id = 20
+    profiled.attn_op.pg = object()
+    q = torch.zeros(1, 1, 2, 4)
+
+    unprofiled._apply_attention(q, q, q)
+    profiled._apply_attention(q, q, q)
+
+    assert profile_callbacks[0] is None
+    assert callable(profile_callbacks[1])
+
+
+def test_wan_model_assigns_profile_identity_to_each_self_attention():
+    wan2pt2 = importlib.import_module("rcm.networks.wan2pt2")
+    model = wan2pt2.WanModel(
+        model_type="i2v",
+        patch_size=(1, 2, 2),
+        text_len=8,
+        in_dim=20,
+        dim=12,
+        ffn_dim=24,
+        freq_dim=8,
+        text_dim=16,
+        out_dim=16,
+        num_heads=1,
+        num_layers=3,
+    )
+
+    assert [block.self_attn.layer_id for block in model.blocks] == [0, 1, 2]
+    assert [
+        block.self_attn.profile_total_layers for block in model.blocks
+    ] == [3, 3, 3]
 
 
 def test_enable_context_parallel_does_not_create_cuda_stream(monkeypatch):
