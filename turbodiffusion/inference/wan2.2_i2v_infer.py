@@ -29,6 +29,7 @@ from imaginaire.utils.io import save_image_or_video
 from imaginaire.utils import log
 
 from rcm.datasets.utils import VIDEO_RES_SIZE_INFO
+from rcm.utils.context_parallel import broadcast
 from rcm.utils.umt5 import clear_umt5_memory, get_umt5_embedding
 from rcm.tokenizers.wan2pt1 import Wan2pt1VAEInterface
 
@@ -211,6 +212,31 @@ def prepare_parallel_text_embedding(
         rank=rank,
     )
     return text_emb, ulysses_group
+
+
+def prepare_sampling_condition(
+    text_embedding,
+    image_condition,
+    num_samples: int,
+    ulysses_group,
+) -> dict:
+    """Build sampling conditions and synchronize static tensors once."""
+    crossattn_emb = repeat(
+        text_embedding.to(**tensor_kwargs),
+        "b l d -> (k b) l d",
+        k=num_samples,
+    )
+    static_condition_is_synchronized = ulysses_group is not None
+    if static_condition_is_synchronized:
+        crossattn_emb = broadcast(crossattn_emb, ulysses_group)
+        image_condition = broadcast(image_condition, ulysses_group)
+    return {
+        "crossattn_emb": crossattn_emb,
+        "y_B_C_T_H_W": image_condition,
+        "static_condition_is_synchronized": (
+            static_condition_is_synchronized
+        ),
+    }
 
 
 def warmup_noise_models(
@@ -469,7 +495,12 @@ if __name__ == "__main__":
     y = y.repeat(args.num_samples, 1, 1, 1, 1)
 
     log.info(f"Generating with prompt: {args.prompt}")
-    condition = {"crossattn_emb": repeat(text_emb.to(**tensor_kwargs), "b l d -> (k b) l d", k=args.num_samples), "y_B_C_T_H_W": y}
+    condition = prepare_sampling_condition(
+        text_embedding=text_emb,
+        image_condition=y,
+        num_samples=args.num_samples,
+        ulysses_group=ulysses_group,
+    )
 
     state_shape = [tokenizer.latent_ch, lat_t, lat_h, lat_w]
 

@@ -55,7 +55,14 @@ def inference_module(monkeypatch):
     umt5_module.get_umt5_embedding = lambda **kwargs: None
     vae_module = types.ModuleType("rcm.tokenizers.wan2pt1")
     vae_module.Wan2pt1VAEInterface = object
+    context_parallel_module = types.ModuleType("rcm.utils.context_parallel")
+    context_parallel_module.broadcast = lambda tensor, group: tensor
     monkeypatch.setitem(sys.modules, "rcm.datasets.utils", dataset_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "rcm.utils.context_parallel",
+        context_parallel_module,
+    )
     monkeypatch.setitem(sys.modules, "rcm.utils.umt5", umt5_module)
     monkeypatch.setitem(sys.modules, "rcm.tokenizers.wan2pt1", vae_module)
 
@@ -543,6 +550,49 @@ def test_enable_ulysses_sets_same_group_on_both_noise_models(inference_module):
     inference_module.enable_ulysses([high, low], group)
 
     assert events == [("high", group), ("low", group)]
+
+
+def test_parallel_sampling_condition_broadcasts_static_inputs_once(
+    inference_module,
+    monkeypatch,
+):
+    group = object()
+    text_embedding = torch.arange(6).view(1, 2, 3)
+    image_condition = torch.arange(8).view(1, 2, 2, 2)
+    broadcast_inputs = []
+
+    def fake_broadcast(tensor, process_group):
+        broadcast_inputs.append((tensor.clone(), process_group))
+        return tensor + 100
+
+    monkeypatch.setattr(inference_module, "broadcast", fake_broadcast)
+    inference_module.tensor_kwargs.clear()
+    inference_module.tensor_kwargs.update(
+        {"device": "cpu", "dtype": text_embedding.dtype}
+    )
+
+    condition = inference_module.prepare_sampling_condition(
+        text_embedding=text_embedding,
+        image_condition=image_condition,
+        num_samples=2,
+        ulysses_group=group,
+    )
+
+    expected_text = text_embedding.repeat(2, 1, 1)
+    torch.testing.assert_close(
+        condition["crossattn_emb"],
+        expected_text + 100,
+    )
+    torch.testing.assert_close(
+        condition["y_B_C_T_H_W"],
+        image_condition + 100,
+    )
+    assert condition["static_condition_is_synchronized"] is True
+    assert len(broadcast_inputs) == 2
+    torch.testing.assert_close(broadcast_inputs[0][0], expected_text)
+    torch.testing.assert_close(broadcast_inputs[1][0], image_condition)
+    assert broadcast_inputs[0][1] is group
+    assert broadcast_inputs[1][1] is group
 
 
 @pytest.mark.parametrize("rank", [0, 7])

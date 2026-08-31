@@ -216,6 +216,57 @@ def test_context_parallel_broadcast_preserves_current_tensor_device(
     torch.testing.assert_close(output, x)
 
 
+@pytest.mark.parametrize(
+    ("static_condition_is_synchronized", "expected_names"),
+    [
+        (False, ["x", "timestep", "text", "image_condition"]),
+        (True, ["x", "timestep"]),
+    ],
+)
+def test_context_parallel_reuses_prebroadcast_static_condition(
+    monkeypatch,
+    static_condition_is_synchronized,
+    expected_names,
+):
+    wan2pt2 = importlib.import_module("rcm.networks.wan2pt2")
+    calls = []
+
+    def fake_broadcast(value, group):
+        calls.append((value, group))
+        return f"broadcast({value})"
+
+    monkeypatch.setattr(wan2pt2, "broadcast", fake_broadcast)
+    group = object()
+
+    outputs = wan2pt2.broadcast_context_parallel_inputs(
+        x="x",
+        timestep="timestep",
+        text="text",
+        image_condition="image_condition",
+        process_group=group,
+        static_condition_is_synchronized=(
+            static_condition_is_synchronized
+        ),
+    )
+
+    assert [value for value, _ in calls] == expected_names
+    assert all(process_group is group for _, process_group in calls)
+    if static_condition_is_synchronized:
+        assert outputs == (
+            "broadcast(x)",
+            "broadcast(timestep)",
+            "text",
+            "image_condition",
+        )
+    else:
+        assert outputs == (
+            "broadcast(x)",
+            "broadcast(timestep)",
+            "broadcast(text)",
+            "broadcast(image_condition)",
+        )
+
+
 @pytest.mark.parametrize("attention_class", ["WanSelfAttention", "WanCrossAttention"])
 def test_wan_attention_bnsd_calls_local_backend_and_restores_bsc(attention_class):
     wan2pt2 = importlib.import_module("rcm.networks.wan2pt2")

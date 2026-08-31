@@ -58,6 +58,24 @@ def mindie_dense_attention(q, k, v):
     return attention_forward(q, k, v, head_first=True)
 
 
+def broadcast_context_parallel_inputs(
+    x,
+    timestep,
+    text,
+    image_condition,
+    process_group,
+    static_condition_is_synchronized: bool,
+):
+    """Synchronize dynamic inputs and any unsynchronized static condition."""
+    x = broadcast(x, process_group)
+    timestep = broadcast(timestep, process_group)
+    if not static_condition_is_synchronized:
+        text = broadcast(text, process_group)
+        if image_condition is not None:
+            image_condition = broadcast(image_condition, process_group)
+    return x, timestep, text, image_condition
+
+
 class VideoRopePosition3DEmb(nn.Module):
     def __init__(
         self,
@@ -651,12 +669,26 @@ class WanModel(nn.Module):
 
         cp_group = getattr(self, "_cp_group", None)
         cp_enabled = (cp_group is not None) and (cp_group.size() > 1)
+        static_condition_is_synchronized = kwargs.pop(
+            "static_condition_is_synchronized",
+            False,
+        )
         if cp_enabled:
-            x_B_C_T_H_W = broadcast(x_B_C_T_H_W, cp_group)
-            timesteps_B_T = broadcast(timesteps_B_T, cp_group)
-            crossattn_emb = broadcast(crossattn_emb, cp_group)
-            if y_B_C_T_H_W is not None:
-                y_B_C_T_H_W = broadcast(y_B_C_T_H_W, cp_group)
+            (
+                x_B_C_T_H_W,
+                timesteps_B_T,
+                crossattn_emb,
+                y_B_C_T_H_W,
+            ) = broadcast_context_parallel_inputs(
+                x=x_B_C_T_H_W,
+                timestep=timesteps_B_T,
+                text=crossattn_emb,
+                image_condition=y_B_C_T_H_W,
+                process_group=cp_group,
+                static_condition_is_synchronized=(
+                    static_condition_is_synchronized
+                ),
+            )
 
         assert timesteps_B_T.shape[1] == 1
         t_B = timesteps_B_T[:, 0]
