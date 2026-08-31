@@ -213,6 +213,36 @@ def prepare_parallel_text_embedding(
     return text_emb, ulysses_group
 
 
+def warmup_noise_models(
+    high_noise_model,
+    low_noise_model,
+    timesteps,
+    boundary: float,
+    predict,
+    rank: int,
+) -> None:
+    """Warm each noise model used by the sampling schedule exactly once."""
+    warmed_models = set()
+    for timestep in timesteps[:-1]:
+        if timestep.item() >= boundary:
+            model_name = "high"
+            model = high_noise_model
+        else:
+            model_name = "low"
+            model = low_noise_model
+        if model_name in warmed_models:
+            continue
+        if rank == 0:
+            log.info(f"Warming up {model_name} noise model.")
+        with torch.no_grad():
+            predict(model, timestep)
+        warmed_models.add(model_name)
+
+    torch.npu.synchronize()
+    if rank == 0:
+        log.info("Warmup complete.")
+
+
 def sampling_progress(timesteps, rank: int):
     """Show the sampling progress bar on rank 0 only."""
     steps = list(zip(timesteps[:-1], timesteps[1:]))
@@ -467,8 +497,26 @@ if __name__ == "__main__":
 
     x = init_noise.to(torch.float64) * t_steps[0]
     ones = torch.ones(x.size(0), 1, device=x.device, dtype=x.dtype)
+
+    def predict(model, timestep):
+        return model(
+            x_B_C_T_H_W=x.to(**tensor_kwargs),
+            timesteps_B_T=(timestep.float() * ones * 1000).to(
+                **tensor_kwargs
+            ),
+            **condition,
+        ).to(torch.float64)
+
     high_noise_model.to(tensor_kwargs["device"])
     low_noise_model.to(tensor_kwargs["device"])
+    warmup_noise_models(
+        high_noise_model=high_noise_model,
+        low_noise_model=low_noise_model,
+        timesteps=t_steps,
+        boundary=args.boundary,
+        predict=predict,
+        rank=rank,
+    )
     net = high_noise_model
     switched = False
     for step_index, (t_cur, t_next) in enumerate(
@@ -487,9 +535,7 @@ if __name__ == "__main__":
             log.info("Switched to low noise model.")
         dit_start = synchronized_time(args.profile_stages)
         with torch.no_grad():
-            v_pred = net(x_B_C_T_H_W=x.to(**tensor_kwargs), timesteps_B_T=(t_cur.float() * ones * 1000).to(**tensor_kwargs), **condition).to(
-                torch.float64
-            )
+            v_pred = predict(net, t_cur)
             dit_end = synchronized_time(args.profile_stages)
             if args.ode:
                 x = x - (t_cur - t_next) * v_pred

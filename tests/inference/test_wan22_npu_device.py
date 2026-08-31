@@ -232,21 +232,122 @@ def test_sampling_profile_is_logged_only_by_rank0(
     ]
 
 
+def test_warmup_runs_each_used_noise_model_once_before_synchronizing(
+    inference_module,
+    monkeypatch,
+):
+    high_noise_model = object()
+    low_noise_model = object()
+    model_names = {
+        high_noise_model: "high",
+        low_noise_model: "low",
+    }
+    events = []
+
+    monkeypatch.setattr(
+        inference_module.log,
+        "info",
+        lambda message: events.append(("log", message)),
+    )
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        types.SimpleNamespace(
+            synchronize=lambda: events.append(("synchronize",))
+        ),
+        raising=False,
+    )
+
+    def predict(model, timestep):
+        events.append(
+            (
+                "predict",
+                model_names[model],
+                float(timestep),
+                torch.is_grad_enabled(),
+            )
+        )
+
+    inference_module.warmup_noise_models(
+        high_noise_model=high_noise_model,
+        low_noise_model=low_noise_model,
+        timesteps=torch.tensor([0.99, 0.80, 0.40, 0.0]),
+        boundary=0.9,
+        predict=predict,
+        rank=0,
+    )
+
+    assert events == [
+        ("log", "Warming up high noise model."),
+        ("predict", "high", pytest.approx(0.99), False),
+        ("log", "Warming up low noise model."),
+        ("predict", "low", pytest.approx(0.80), False),
+        ("synchronize",),
+        ("log", "Warmup complete."),
+    ]
+
+
+def test_warmup_skips_unused_low_noise_model_and_nonzero_rank_logs(
+    inference_module,
+    monkeypatch,
+):
+    high_noise_model = object()
+    low_noise_model = object()
+    predicted_models = []
+
+    monkeypatch.setattr(
+        inference_module.log,
+        "info",
+        lambda message: pytest.fail(
+            f"nonzero rank logged warmup message: {message}"
+        ),
+    )
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        types.SimpleNamespace(synchronize=lambda: None),
+        raising=False,
+    )
+
+    inference_module.warmup_noise_models(
+        high_noise_model=high_noise_model,
+        low_noise_model=low_noise_model,
+        timesteps=torch.tensor([0.99, 0.95, 0.0]),
+        boundary=0.9,
+        predict=lambda model, timestep: predicted_models.append(model),
+        rank=3,
+    )
+
+    assert predicted_models == [high_noise_model]
+
+
 def test_sampling_preloads_both_noise_models_before_progress():
     tree = ast.parse(SCRIPT_PATH.read_text())
     loop = _sampling_loop(tree)
     calls = [
         node
         for node in _model_transfer_calls([tree])
-        if loop.lineno - 10 <= node.lineno < loop.lineno
+        if node.lineno < loop.lineno
     ]
 
-    device_transfers = {
-        node.func.value.id
-        for node in calls
-        if node.func.attr == "to"
+    latest_transfer = {
+        model_name: max(
+            (
+                node
+                for node in calls
+                if node.func.value.id == model_name
+            ),
+            key=lambda node: node.lineno,
+        )
+        for model_name in {"high_noise_model", "low_noise_model"}
     }
-    assert device_transfers == {"high_noise_model", "low_noise_model"}
+    assert {
+        model_name: node.func.attr
+        for model_name, node in latest_transfer.items()
+    } == {
+        "high_noise_model": "to",
+        "low_noise_model": "to",
+    }
 
 
 def test_sampling_switch_does_not_transfer_noise_models():
