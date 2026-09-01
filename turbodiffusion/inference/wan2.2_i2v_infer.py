@@ -16,7 +16,6 @@
 import argparse
 import math
 import os
-import time
 
 import torch
 from einops import rearrange, repeat
@@ -280,38 +279,6 @@ def sampling_progress(timesteps, rank: int):
     )
 
 
-def synchronized_time(enabled: bool) -> float | None:
-    """Return a host timestamp after draining the current NPU stream."""
-    if not enabled:
-        return None
-    torch.npu.synchronize()
-    return time.perf_counter()
-
-
-def log_sampling_profile(
-    enabled: bool,
-    rank: int,
-    step_index: int,
-    switch_seconds: float,
-    dit_seconds: float,
-    update_seconds: float,
-    total_seconds: float,
-) -> None:
-    """Log synchronized sampling-stage timings from rank 0 only."""
-    if not enabled or rank != 0:
-        return
-    other_seconds = max(
-        total_seconds - switch_seconds - dit_seconds - update_seconds,
-        0.0,
-    )
-    log.info(
-        f"Sampling profile: step={step_index} "
-        f"switch={switch_seconds:.4f}s dit={dit_seconds:.4f}s "
-        f"update={update_seconds:.4f}s other={other_seconds:.4f}s "
-        f"total={total_seconds:.4f}s"
-    )
-
-
 def decode_and_save_rank0(rank, tokenizer, samples, save_path: str) -> bool:
     """Decode and save the generated video on rank 0 only."""
     if rank != 0:
@@ -361,11 +328,6 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--default_norm", action="store_true", help="Whether to replace LayerNorm/RMSNorm layers with faster versions")
     parser.add_argument("--serve", action="store_true", help="Launch interactive TUI server mode (keeps model loaded)")
     parser.add_argument("--device_id", type=int, default=0, help="Ascend NPU device ID")
-    parser.add_argument(
-        "--profile-stages",
-        action="store_true",
-        help="Synchronize and log per-step switch, DiT, and solver timings",
-    )
     parser.add_argument(
         "--ulysses-size",
         type=int,
@@ -550,24 +512,13 @@ if __name__ == "__main__":
     )
     net = high_noise_model
     switched = False
-    for step_index, (t_cur, t_next) in enumerate(
-        sampling_progress(t_steps, rank)
-    ):
-        step_start = synchronized_time(args.profile_stages)
-        switch_seconds = 0.0
+    for t_cur, t_next in sampling_progress(t_steps, rank):
         if t_cur.item() < args.boundary and not switched:
-            switch_start = synchronized_time(args.profile_stages)
             net = low_noise_model
             switched = True
-            if args.profile_stages:
-                switch_seconds = (
-                    synchronized_time(True) - switch_start
-                )
             log.info("Switched to low noise model.")
-        dit_start = synchronized_time(args.profile_stages)
         with torch.no_grad():
             v_pred = predict(net, t_cur)
-            dit_end = synchronized_time(args.profile_stages)
             if args.ode:
                 x = x - (t_cur - t_next) * v_pred
             else:
@@ -577,17 +528,6 @@ if __name__ == "__main__":
                     device=tensor_kwargs["device"],
                     generator=generator,
                 )
-        step_end = synchronized_time(args.profile_stages)
-        if args.profile_stages:
-            log_sampling_profile(
-                enabled=True,
-                rank=rank,
-                step_index=step_index,
-                switch_seconds=switch_seconds,
-                dit_seconds=dit_end - dit_start,
-                update_seconds=step_end - dit_end,
-                total_seconds=step_end - step_start,
-            )
     samples = x.float()
     high_noise_model.cpu()
     low_noise_model.cpu()

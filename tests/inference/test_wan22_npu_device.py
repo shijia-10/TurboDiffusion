@@ -12,17 +12,25 @@ SCRIPT_PATH = Path(__file__).parents[2] / "turbodiffusion/inference/wan2.2_i2v_i
 
 
 def _sampling_loop(tree):
-    return next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.For)
-        and isinstance(node.iter, ast.Call)
-        and isinstance(node.iter.func, ast.Name)
-        and node.iter.func.id == "enumerate"
-        and isinstance(node.iter.args[0], ast.Call)
-        and isinstance(node.iter.args[0].func, ast.Name)
-        and node.iter.args[0].func.id == "sampling_progress"
-    )
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.For) or not isinstance(
+            node.iter,
+            ast.Call,
+        ):
+            continue
+        iterator = node.iter
+        if (
+            isinstance(iterator.func, ast.Name)
+            and iterator.func.id == "enumerate"
+        ):
+            iterator = iterator.args[0]
+        if (
+            isinstance(iterator, ast.Call)
+            and isinstance(iterator.func, ast.Name)
+            and iterator.func.id == "sampling_progress"
+        ):
+            return node
+    raise AssertionError("sampling loop not found")
 
 
 def _model_transfer_calls(nodes):
@@ -163,7 +171,7 @@ def test_i2v_cli_exposes_only_ulysses_parallel_degree(
     assert not hasattr(args, "distributed_backend")
 
 
-def test_i2v_cli_stage_profiling_is_opt_in(inference_module, monkeypatch):
+def test_i2v_cli_does_not_expose_stage_profiling(inference_module, monkeypatch):
     base_args = [
         "wan2.2_i2v_infer.py",
         "--high_noise_model_path",
@@ -172,71 +180,24 @@ def test_i2v_cli_stage_profiling_is_opt_in(inference_module, monkeypatch):
         "low.pth",
     ]
     monkeypatch.setattr(sys, "argv", base_args)
-    assert inference_module.parse_arguments().profile_stages is False
+    assert not hasattr(inference_module.parse_arguments(), "profile_stages")
 
     monkeypatch.setattr(sys, "argv", base_args + ["--profile-stages"])
-    assert inference_module.parse_arguments().profile_stages is True
+    with pytest.raises(SystemExit):
+        inference_module.parse_arguments()
 
 
-def test_synchronized_time_only_synchronizes_when_enabled(
-    inference_module,
-    monkeypatch,
-):
-    events = []
-    monkeypatch.setattr(
-        torch,
-        "npu",
-        types.SimpleNamespace(
-            synchronize=lambda: events.append("synchronize")
-        ),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        inference_module.time,
-        "perf_counter",
-        lambda: events.append("clock") or 12.5,
-    )
+def test_sampling_loop_has_no_manual_stage_timing():
+    source = SCRIPT_PATH.read_text()
+    tree = ast.parse(source)
+    called_names = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
 
-    assert inference_module.synchronized_time(enabled=False) is None
-    assert events == []
-    assert inference_module.synchronized_time(enabled=True) == 12.5
-    assert events == ["synchronize", "clock"]
-
-
-def test_sampling_profile_is_logged_only_by_rank0(
-    inference_module,
-    monkeypatch,
-):
-    messages = []
-    monkeypatch.setattr(
-        inference_module.log,
-        "info",
-        lambda message: messages.append(message),
-    )
-
-    inference_module.log_sampling_profile(
-        enabled=True,
-        rank=3,
-        step_index=0,
-        switch_seconds=1.0,
-        dit_seconds=2.0,
-        update_seconds=0.5,
-        total_seconds=4.0,
-    )
-    inference_module.log_sampling_profile(
-        enabled=True,
-        rank=0,
-        step_index=2,
-        switch_seconds=1.0,
-        dit_seconds=2.0,
-        update_seconds=0.5,
-        total_seconds=4.0,
-    )
-
-    assert messages == [
-        "Sampling profile: step=2 switch=1.0000s "
-        "dit=2.0000s update=0.5000s other=0.5000s total=4.0000s"
-    ]
+    assert "synchronized_time" not in called_names
+    assert "log_sampling_profile" not in called_names
 
 
 def test_warmup_runs_each_used_noise_model_once_before_synchronizing(
