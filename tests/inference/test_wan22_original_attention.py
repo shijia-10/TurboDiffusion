@@ -49,6 +49,68 @@ def test_mindie_dense_attention_declares_bnsd_layout(monkeypatch):
     assert calls == [((1, 2, 4, 128),) * 3 + (True,)]
 
 
+def test_original_checkpoint_loading_ignores_only_sla_projection_weights():
+    modify_model = importlib.import_module("modify_model")
+
+    class DenseAttentionModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1))
+
+    model = DenseAttentionModel()
+    checkpoint = {
+        "weight": torch.ones(1),
+        (
+            "blocks.0._checkpoint_wrapped_module.self_attn."
+            "attn_op.local_attn.proj_l.weight"
+        ): torch.ones(1),
+        (
+            "blocks.0._checkpoint_wrapped_module.self_attn."
+            "attn_op.local_attn.proj_l.bias"
+        ): torch.ones(1),
+    }
+
+    modify_model.load_dit_state_dict(
+        model,
+        checkpoint,
+        attention_type="original",
+    )
+
+    torch.testing.assert_close(model.weight, torch.ones(1))
+
+
+def test_original_checkpoint_loading_rejects_unrelated_unexpected_weights():
+    modify_model = importlib.import_module("modify_model")
+    model = torch.nn.Linear(1, 1, bias=False)
+    checkpoint = {
+        "weight": torch.ones(1, 1),
+        "unexpected.weight": torch.ones(1),
+    }
+
+    with pytest.raises(RuntimeError, match="Unexpected key"):
+        modify_model.load_dit_state_dict(
+            model,
+            checkpoint,
+            attention_type="original",
+        )
+
+
+def test_sla_checkpoint_loading_keeps_projection_weights_strict():
+    modify_model = importlib.import_module("modify_model")
+    model = torch.nn.Linear(1, 1, bias=False)
+    checkpoint = {
+        "weight": torch.ones(1, 1),
+        "self_attn.attn_op.local_attn.proj_l.weight": torch.ones(1),
+    }
+
+    with pytest.raises(RuntimeError, match="Unexpected key"):
+        modify_model.load_dit_state_dict(
+            model,
+            checkpoint,
+            attention_type="sla",
+        )
+
+
 @pytest.mark.parametrize("attention_class", ["WanSelfAttention", "WanCrossAttention"])
 def test_original_wan_attention_uses_mindie_dense_backend(
     monkeypatch,

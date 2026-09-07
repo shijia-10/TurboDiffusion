@@ -91,7 +91,13 @@ def test_get_umt5_embedding_uses_npu_by_default(monkeypatch):
     events = []
 
     class FakeEncoder:
-        def __init__(self, text_len, device, checkpoint_path):
+        def __init__(
+            self,
+            text_len,
+            device,
+            checkpoint_path,
+            tokenizer_path,
+        ):
             events.append(("init", device))
 
         def __call__(self, prompts, device):
@@ -105,6 +111,38 @@ def test_get_umt5_embedding_uses_npu_by_default(monkeypatch):
 
     assert result == "embedding"
     assert events == [("init", "npu"), ("forward", "npu")]
+
+
+def test_get_umt5_embedding_passes_explicit_tokenizer_path(monkeypatch):
+    umt5 = importlib.import_module("rcm.utils.umt5")
+    events = []
+
+    class FakeEncoder:
+        def __init__(
+            self,
+            text_len,
+            device,
+            checkpoint_path,
+            tokenizer_path,
+        ):
+            events.append(("init", checkpoint_path, tokenizer_path))
+
+        def __call__(self, prompts, device):
+            return "embedding"
+
+    monkeypatch.setattr(umt5, "UMT5EncoderModel", FakeEncoder)
+    umt5.t5_encoder = None
+
+    result = umt5.get_umt5_embedding(
+        "umt5.pth",
+        "a prompt",
+        tokenizer_path="/models/google/umt5-xxl",
+    )
+
+    assert result == "embedding"
+    assert events == [
+        ("init", "umt5.pth", "/models/google/umt5-xxl")
+    ]
 
 
 def test_clear_umt5_memory_empties_npu_cache(monkeypatch):

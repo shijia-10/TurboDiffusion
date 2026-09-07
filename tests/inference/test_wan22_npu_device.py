@@ -602,7 +602,7 @@ def test_every_rank_initializes_hccl_before_computing_umt5_locally(
     )
 
     actual, actual_group = inference_module.prepare_parallel_text_embedding(
-        checkpoint_path="umt5.pth",
+        checkpoint_path="/models/umt5.pth",
         prompt="a cat",
         rank=rank,
     )
@@ -614,9 +614,10 @@ def test_every_rank_initializes_hccl_before_computing_umt5_locally(
         (
             "compute",
             {
-                "checkpoint_path": "umt5.pth",
+                "checkpoint_path": "/models/umt5.pth",
                 "prompts": "a cat",
                 "device": "cpu",
+                "tokenizer_path": "/models/google/umt5-xxl",
                 "sync_distributed_states": False,
             },
         ),

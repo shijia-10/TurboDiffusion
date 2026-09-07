@@ -535,6 +535,7 @@ def get_umt5_embedding(
     prompts: Union[str, List[str]],
     device: str = "npu",
     max_length: int = 512,
+    tokenizer_path: str = "google/umt5-xxl",
     sync_distributed_states: bool = True,
 ) -> torch.Tensor:
     global t5_encoder
@@ -543,11 +544,17 @@ def get_umt5_embedding(
             text_len=max_length,
             device=device,
             checkpoint_path=checkpoint_path,
+            tokenizer_path=tokenizer_path,
             sync_distributed_states=False,
         )
         return encoder(prompts, device=device)
     if t5_encoder is None:
-        t5_encoder = UMT5EncoderModel(text_len=max_length, device=device, checkpoint_path=checkpoint_path)
+        t5_encoder = UMT5EncoderModel(
+            text_len=max_length,
+            device=device,
+            checkpoint_path=checkpoint_path,
+            tokenizer_path=tokenizer_path,
+        )
     return t5_encoder(prompts, device=device)
 
 

@@ -183,12 +183,18 @@ def prepare_text_embedding(
     rank: int = 0,
 ) -> torch.Tensor:
     """Compute one text embedding on the already-bound local NPU."""
+    tokenizer_path = os.path.join(
+        os.path.dirname(checkpoint_path),
+        "google",
+        "umt5-xxl",
+    )
     log.info(f"[rank={rank}] UMT5 embedding begin")
     with torch.no_grad():
         text_emb = get_umt5_embedding(
             checkpoint_path=checkpoint_path,
             prompts=prompt,
             device=tensor_kwargs["device"],
+            tokenizer_path=tokenizer_path,
             sync_distributed_states=sync_distributed_states,
         ).to(**tensor_kwargs)
     torch.npu.synchronize()

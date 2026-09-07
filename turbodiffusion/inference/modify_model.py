@@ -91,6 +91,27 @@ def replace_linear_norm(
 
 tensor_kwargs = {"device": "cuda", "dtype": torch.bfloat16}
 
+_SLA_PROJECTION_SUFFIXES = (
+    "self_attn.attn_op.local_attn.proj_l.weight",
+    "self_attn.attn_op.local_attn.proj_l.bias",
+)
+
+
+def load_dit_state_dict(
+    model: torch.nn.Module,
+    state_dict: dict,
+    attention_type: str,
+):
+    """Load a DiT checkpoint, dropping only SLA-only weights for dense attention."""
+    if attention_type == "original":
+        state_dict = {
+            key: value
+            for key, value in state_dict.items()
+            if not key.endswith(_SLA_PROJECTION_SUFFIXES)
+        }
+    return model.load_state_dict(state_dict, strict=True, assign=True)
+
+
 def select_model(model_name: str) -> torch.nn.Module:
     if model_name == "Wan2.1-1.3B":
         return WanModel2pt1(
@@ -143,7 +164,7 @@ def create_model(dit_path: str, args: argparse.Namespace) -> torch.nn.Module:
     if args.attention_type == "sla":
         net = replace_attention(net, attention_type=args.attention_type, sla_topk=args.sla_topk)
     replace_linear_norm(net, replace_linear=args.quant_linear, replace_norm=not args.default_norm, quantize=False)
-    net.load_state_dict(state_dict, assign=True)
+    load_dit_state_dict(net, state_dict, attention_type=args.attention_type)
     net = net.to(tensor_kwargs["device"]).eval()
     del state_dict
     return net
