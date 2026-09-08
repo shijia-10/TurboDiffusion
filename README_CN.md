@@ -203,42 +203,69 @@ export PYTHONPATH=turbodiffusion${PYTHONPATH:+:$PYTHONPATH}
 仓库提供单卡运行脚本：
 
 ```bash
-MODEL_DIR=/path/to/TurboWan2.2-I2V-A14B-720P \
-NPU_ID=0 \
-IMAGE_PATH=assets/i2v_inputs/i2v_input_0.jpg \
-SAVE_PATH=output/wan2.2_i2v_single_720p_81f_sla.mp4 \
-PROMPT="A cinematic video of the subject moving naturally" \
-bash scripts/inference_wan2.2_i2v_npu_single.sh
+export PYTHONPATH=turbodiffusion
+export FAST_LAYERNORM=0
+export HCCL_NPU_SOCKET_PORT_RANGE="auto"
+export ASCEND_RT_VISIBLE_DEVICES=3
+
+python turbodiffusion/inference/wan2.2_i2v_infer.py \
+    --model Wan2.2-A14B \
+    --low_noise_model_path /mnt/share/weights/TurboWan2.2-I2V-A14B-720P/TurboWan2.2-I2V-A14B-low-720P.pth \
+    --high_noise_model_path /mnt/share/weights/TurboWan2.2-I2V-A14B-720P/TurboWan2.2-I2V-A14B-high-720P.pth \
+    --text_encoder_path /mnt/share/weights/TurboWan2.2-I2V-A14B-720P/models_t5_umt5-xxl-enc-bf16.pth \
+    --vae_path /mnt/share/weights/TurboWan2.2-I2V-A14B-720P/Wan2.1_VAE.pth \
+    --resolution 720p \
+    --adaptive_resolution \
+    --image_path assets/i2v_inputs/i2v_input_0.jpg \
+    --prompt "POV selfie video, ultra-messy and extremely fast. A white cat in sunglasses stands on a surfboard with a neutral look when the board suddenly whips sideways, throwing cat and camera into the water; the frame dives sharply downward, swallowed by violent bursts of bubbles, spinning turbulence, and smeared water streaks as the camera sinks. Shadows thicken, pressure ripples distort the edges, and loose bubbles rush upward past the lens, showing the camera is still sinking. Then the cat kicks upward with explosive speed, dragging the view through churning bubbles and rapidly brightening water as sunlight floods back in; the camera races upward, water streaming off the lens, and finally breaks the surface in a sudden blast of light and spray, snapping back into a crooked, frantic selfie as the cat resurfaces." \
+    --num_samples 1 \
+    --num_steps 4 \
+    --default_norm \
+    --attention_type sla \
+    --sla_topk 0.1 \
+    --save_path output/generated_video_layernorm_0.mp4 \
+    --num_frames 81 \
+    --ode
 ```
 
 参数说明：
 
-- `MODEL_DIR`：High/Low DiT、umT5、tokenizer 和 VAE 所在的模型根目录；
-- `NPU_ID`：使用的物理 NPU 编号；
-- `IMAGE_PATH`：输入图片路径；
-- `SAVE_PATH`：输出 MP4 路径；
-- `PROMPT`：视频生成提示词；
-- `FAST_LAYERNORM`：设置为 `1` 时使用 MindIE Fast LayerNorm。
-
-脚本将指定的物理 NPU 映射为逻辑 `npu:0`，并使用非量化权重、SLA、720P、81 帧和 4 steps 生成视频。
-
-如需验证 MindIE Dense Attention 路径，可以设置：
-
-```bash
-ATTENTION_TYPE=original \
-bash scripts/inference_wan2.2_i2v_npu_single.sh
-```
 
 #### 3.3.2 八卡性能测试
 
 仓库提供单机八卡 Ulysses 运行脚本：
 
 ```bash
-MODEL_DIR=/path/to/TurboWan2.2-I2V-A14B-720P \
-IMAGE_PATH=assets/i2v_inputs/i2v_input_0.jpg \
-SAVE_PATH=output/wan2.2_i2v_8card_720p_81f_sla.mp4 \
-PROMPT="A cinematic video of the subject moving naturally" \
-bash scripts/inference_wan2.2_i2v_npu_8card.sh
+export PYTHONPATH=turbodiffusion
+
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export PYTORCH_NPU_ALLOC_CONF='expandable_segments:True'
+export TASK_QUEUE_ENABLE=2
+export CPU_AFFINITY_CONF=1
+export TOKENIZERS_PARALLELISM=false
+export FAST_LAYERNORM=1
+export HCCL_NPU_SOCKET_PORT_RANGE="auto"
+
+torchrun --nproc_per_node=8 turbodiffusion/inference/wan2.2_i2v_infer.py \
+    --model Wan2.2-A14B \
+    --low_noise_model_path /mnt/share/weights/TurboWan2.2-I2V-A14B-720P/TurboWan2.2-I2V-A14B-low-720P.pth \
+    --high_noise_model_path /mnt/share/weights/TurboWan2.2-I2V-A14B-720P/TurboWan2.2-I2V-A14B-high-720P.pth \
+    --text_encoder_path /mnt/share/weights/TurboWan2.2-I2V-A14B-720P/models_t5_umt5-xxl-enc-bf16.pth \
+    --vae_path /mnt/share/weights/TurboWan2.2-I2V-A14B-720P/Wan2.1_VAE.pth \
+    --resolution 720p \
+    --aspect_ratio 16:9 \
+    --adaptive_resolution \
+    --image_path assets/i2v_inputs/i2v_input_0.jpg \
+    --prompt "POV selfie video, ultra-messy and extremely fast. A white cat in sunglasses stands on a surfboard with a neutral look when the board suddenly whips sideways, throwing cat and camera into the water; the frame dives sharply downward, swallowed by violent bursts of bubbles, spinning turbulence, and smeared water streaks as the camera sinks. Shadows thicken, pressure ripples distort the edges, and loose bubbles rush upward past the lens, showing the camera is still sinking. Then the cat kicks upward with explosive speed, dragging the view through churning bubbles and rapidly brightening water as sunlight floods back in; the camera races upward, water streaming off the lens, and finally breaks the surface in a sudden blast of light and spray, snapping back into a crooked, frantic selfie as the cat resurfaces." \
+    --num_samples 1 \
+    --num_steps 4 \
+    --num_frames 81 \
+    --attention_type sla \
+    --sla_topk 0.1 \
+    --default_norm \
+    --ulysses-size 8 \
+    --save_path output/ulysses8.mp4 \
+    --ode
 ```
 
 脚本使用以下并行配置：
