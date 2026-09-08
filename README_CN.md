@@ -1,13 +1,3 @@
----
-pipeline_tag: text-to-video
-frameworks:
-  - PyTorch
-hardwares:
-  - NPU
-  - Ascend 950
-license: apache-2.0
----
-
 # TurboWan2.2 I2V 推理指导
 
 ## 目录
@@ -230,6 +220,28 @@ python turbodiffusion/inference/wan2.2_i2v_infer.py \
 
 参数说明：
 
+- PYTHONPATH: 将 `turbodiffusion` 加入 Python 模块搜索路径。
+- FAST_LAYERNORM: 为0表示使用原生LayerNorm计算方式，为1表示使用MindIE高性能LayerNorm算子。该环境变量需要在启动Python进程前设置。
+- HCCL_NPU_SOCKET_PORT_RANGE: HCCL通信端口范围，设置为`auto`表示由HCCL自动选择。
+- ASCEND_RT_VISIBLE_DEVICES: 指定当前进程可见的物理NPU。示例中的3号卡会映射为进程内的逻辑`npu:0`。
+- model: 模型结构，Wan2.2 I2V固定使用`Wan2.2-A14B`。
+- low_noise_model_path: Low-noise TurboWan DiT权重路径。
+- high_noise_model_path: High-noise TurboWan DiT权重路径。
+- text_encoder_path: umT5文本编码器权重路径。程序会从该文件的父目录自动加载`google/umt5-xxl` tokenizer。
+- vae_path: Wan2.2 I2V使用的VAE权重路径。
+- resolution: 输出视频的目标分辨率，当前支持`480p`和`720p`，示例使用`720p`。
+- aspect_ratio: 目标输出宽高比；单卡示例未显式传入，使用默认值`16:9`。
+- adaptive_resolution: 根据输入图片宽高比自适应输出尺寸，并以`resolution`和`aspect_ratio`确定的面积作为目标面积。
+- image_path: 输入首帧图片路径。
+- prompt: 文本提示词，用于描述期望生成的视频内容和运动。
+- num_samples: 单次推理生成的视频数量。
+- num_steps: rCM采样步数，支持1至4步，示例使用4步。
+- default_norm: 保留Wan原始LayerNorm和RMSNorm模块结构。设置`FAST_LAYERNORM=1`时，模型前向计算仍会调用MindIE高性能LayerNorm算子。
+- attention_type: Attention类型，`sla`表示Self Attention使用MindIE SLA，`original`表示Self Attention使用MindIE Dense Attention；Cross Attention均使用MindIE Dense Attention。
+- sla_topk: SLA保留的Top-k比例，仅在`attention_type=sla`时生效，示例使用0.1。
+- save_path: 生成视频的保存路径，包含输出文件名和扩展名。
+- num_frames: 生成视频的帧数，示例使用81帧。
+- ode: 使用ODE采样；相较SDE通常更锐利，但鲁棒性相对较低。
 
 #### 3.3.2 八卡性能测试
 
@@ -267,6 +279,21 @@ torchrun --nproc_per_node=8 turbodiffusion/inference/wan2.2_i2v_infer.py \
     --save_path output/ulysses8.mp4 \
     --ode
 ```
+
+参数说明：
+
+以下仅说明相较单卡新增或不同的参数，其余参数含义与单卡相同。
+
+- ASCEND_RT_VISIBLE_DEVICES: 指定八个可见NPU，`torchrun`启动的每个进程分别绑定一张卡。
+- PYTORCH_NPU_ALLOC_CONF: 设置为`expandable_segments:True`，允许NPU内存段按需扩展，以减少内存碎片。
+- TASK_QUEUE_ENABLE: 设置为2，开启NPU任务队列调度。
+- CPU_AFFINITY_CONF: 设置为1，开启CPU亲和性配置。
+- TOKENIZERS_PARALLELISM: 设置为false，关闭Hugging Face tokenizer内部并行，避免多进程推理时产生额外线程和告警。
+- FAST_LAYERNORM: 设置为1，使用MindIE高性能LayerNorm算子。
+- HCCL_NPU_SOCKET_PORT_RANGE: HCCL通信端口范围，设置为`auto`表示由HCCL自动选择。
+- nproc_per_node: 单机启动的推理进程数，示例设置为8，与使用的NPU数量一致。
+- aspect_ratio: 目标输出宽高比，示例为`16:9`；开启`adaptive_resolution`后，实际尺寸会根据输入图片宽高比调整。
+- ulysses-size: Ulysses序列并行度，必须与当前进程组规模一致，八卡示例设置为8。
 
 脚本使用以下并行配置：
 
