@@ -1,0 +1,8 @@
+loguru
+imageio[ffmpeg]
+omegaconf
+fvcore
+ftfy
+prompt-toolkit>=3.0
+ninja
+pynvml
